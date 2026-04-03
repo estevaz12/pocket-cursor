@@ -17,19 +17,19 @@ import path from 'path';
 
 const args = process.argv.slice(2);
 if (args.length === 0) {
-    console.error('Usage: node md_to_image.mjs <input.md> [--out output.png] [--width 450]');
-    process.exit(1);
+  console.error('Usage: node md_to_image.mjs <input.md> [--out output.png] [--width 450]');
+  process.exit(1);
 }
 
 const inputPath = path.resolve(args[0]);
 const outIdx = args.indexOf('--out');
-const outputPath = outIdx !== -1 && args[outIdx + 1]
+const outputPath =
+  outIdx !== -1 && args[outIdx + 1]
     ? path.resolve(args[outIdx + 1])
     : inputPath.replace(/\.md$/i, '.png');
 const widthIdx = args.indexOf('--width');
-const viewportWidth = widthIdx !== -1 && args[widthIdx + 1]
-    ? parseInt(args[widthIdx + 1], 10)
-    : 450;
+const viewportWidth =
+  widthIdx !== -1 && args[widthIdx + 1] ? parseInt(args[widthIdx + 1], 10) : 450;
 
 // Read the markdown file
 const reportDir = path.dirname(inputPath);
@@ -40,11 +40,12 @@ let htmlContent = marked(markdownContent);
 
 // Function to convert image to base64
 async function imageToBase64(imagePath) {
-    const imageBuffer = await fs.readFile(imagePath);
-    const base64 = imageBuffer.toString('base64');
-    const ext = path.extname(imagePath).toLowerCase();
-    const mimeType = ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/gif';
-    return `data:${mimeType};base64,${base64}`;
+  const imageBuffer = await fs.readFile(imagePath);
+  const base64 = imageBuffer.toString('base64');
+  const ext = path.extname(imagePath).toLowerCase();
+  const mimeType =
+    ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/gif';
+  return `data:${mimeType};base64,${base64}`;
 }
 
 // Find all image references and convert to base64
@@ -53,28 +54,28 @@ let match;
 const replacements = [];
 
 while ((match = imgRegex.exec(htmlContent)) !== null) {
-    const originalSrc = match[1];
-    let imagePath;
-    
-    if (originalSrc.startsWith('../')) {
-        imagePath = path.resolve(reportDir, originalSrc);
-    } else if (!originalSrc.startsWith('http') && !originalSrc.startsWith('data:')) {
-        imagePath = path.resolve(reportDir, originalSrc);
+  const originalSrc = match[1];
+  let imagePath;
+
+  if (originalSrc.startsWith('../')) {
+    imagePath = path.resolve(reportDir, originalSrc);
+  } else if (!originalSrc.startsWith('http') && !originalSrc.startsWith('data:')) {
+    imagePath = path.resolve(reportDir, originalSrc);
+  }
+
+  if (imagePath) {
+    try {
+      const base64Src = await imageToBase64(imagePath);
+      replacements.push({ original: originalSrc, replacement: base64Src });
+    } catch (error) {
+      // Image not found, skip
     }
-    
-    if (imagePath) {
-        try {
-            const base64Src = await imageToBase64(imagePath);
-            replacements.push({ original: originalSrc, replacement: base64Src });
-        } catch (error) {
-            // Image not found, skip
-        }
-    }
+  }
 }
 
 // Apply all replacements
 for (const { original, replacement } of replacements) {
-    htmlContent = htmlContent.replace(`src="${original}"`, `src="${replacement}"`);
+  htmlContent = htmlContent.replace(`src="${original}"`, `src="${replacement}"`);
 }
 
 // Clean HTML based on test template (Montserrat, 0.04em spacing, 1.4 line-height)
@@ -302,9 +303,9 @@ const fullHtml = `
 `;
 
 // Render to PNG
-const browser = await puppeteer.launch({ 
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+const browser = await puppeteer.launch({
+  headless: true,
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 const page = await browser.newPage();
@@ -312,16 +313,18 @@ const page = await browser.newPage();
 // Width determines aspect ratio; height adjusts to content via fullPage screenshot
 await page.setViewport({ width: viewportWidth, height: 600, deviceScaleFactor: 2 });
 
-await page.setContent(fullHtml, { 
-    waitUntil: 'networkidle0' 
+await page.setContent(fullHtml, {
+  waitUntil: 'networkidle0',
 });
 
 await page.screenshot({
-    path: outputPath,
-    fullPage: true,
+  path: outputPath,
+  fullPage: true,
 });
 
 await browser.close();
 
 const stats = await fs.stat(outputPath);
-console.log(`${path.basename(inputPath)} -> ${path.basename(outputPath)} (${(stats.size / 1024).toFixed(1)} KB)`);
+console.log(
+  `${path.basename(inputPath)} -> ${path.basename(outputPath)} (${(stats.size / 1024).toFixed(1)} KB)`
+);

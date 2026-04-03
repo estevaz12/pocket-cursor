@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pocket-cursor"
+version = "1.0.0"
+description = "Telegram bridge for Cursor IDE"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+  "-q",
+  "--cov=lib",
+  "--cov-report=term-missing",
+  "--cov-report=xml",
+  "--cov-fail-under=0",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["lib"]
+omit = ["tests/*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = ["tests/node_modules", ".git", "node_modules"]
+
+[tool.ruff.lint]
+# Keep scope tight: large legacy files; E501 handled via line-length + ignore where needed
+select = ["E4", "E7", "E9", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"setup_local_render.py" = ["E402"]
+"scripts/voice_message.py" = ["E402"]
+"scripts/upload_pronunciation.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+  "pocket_cursor.py",
+  "chat_detection.py",
+  "start_cursor.py",
+  "restart_pocket_cursor.py",
+  "setup_local_render.py",
+  "lib",
+  "scripts",
+]
+ignore_missing_imports = true
+warn_unused_ignores = true
+explicit_package_bases = true
+namespace_packages = true

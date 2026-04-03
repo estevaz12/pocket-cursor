@@ -4,7 +4,13 @@
   "description": "**Your Cursor IDE, in your pocket.**",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "python3 -m compileall -q pocket_cursor.py chat_detection.py start_cursor.py restart_pocket_cursor.py setup_local_render.py lib scripts",
+    "test": "python3 -m pytest tests/",
+    "lint": "python3 -m ruff check .",
+    "format": "python3 -m ruff format . && prettier --write .",
+    "format:check": "python3 -m ruff format --check . && prettier --check .",
+    "typecheck": "python3 -m mypy",
+    "validate": "npm run lint && npm run format:check && npm run typecheck && npm run test"
   },
   "keywords": [],
   "author": "",
@@ -12,5 +18,9 @@
   "dependencies": {
     "marked": "^17.0.2",
     "puppeteer": "^24.37.3"
+  },
+  "devDependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "prettier": "^3.8.1"
   }
 }

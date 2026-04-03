@@ -1,0 +1,11 @@
+node_modules
+tests/node_modules
+.git
+**/*.py
+coverage
+.pocket-cursor
+.venv
+.venv-tmp
+.pytest_cache
+**/.venv/**
+**/site-packages/**

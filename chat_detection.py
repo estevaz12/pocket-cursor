@@ -10,21 +10,26 @@ Exports:
 
 See _active_chat_detection_plan.md for design rationale and DOM analysis.
 """
-import json, threading, builtins
+
+import builtins
+import json
+import threading
 from datetime import datetime
+from typing import Any
 
 
 def ts_print(*args, **kwargs):
     ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
     kwargs.setdefault('flush', True)
-    builtins.print(f"[{ts}]", *args, **kwargs)
+    builtins.print(f'[{ts}]', *args, **kwargs)
+
 
 print = ts_print
 
 # ── CDP helpers (per-connection, no global state) ─────────────────────────────
 
 _lock = threading.Lock()
-_msg_counters = {}  # ws_conn -> int
+_msg_counters: dict[Any, int] = {}  # ws_conn -> int
 
 
 def _next_id(ws_conn):
@@ -422,6 +427,7 @@ _LIST_CHATS_JS = r"""
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+
 def install_chat_listener(ws_conn):
     """Install click/focusin listener + __pc_report binding on a CDP connection.
 
@@ -442,6 +448,7 @@ def start_chat_listener(ws_conn, label, on_switch, on_rename=None, on_dead=None)
     Only triggers callbacks for actual switches and renames.
     on_dead(label, exception) is called when the listener thread exits.
     """
+
     def _listener():
         try:
             while True:
@@ -457,7 +464,7 @@ def start_chat_listener(ws_conn, label, on_switch, on_rename=None, on_dead=None)
                     if ev.get('type') == 'context':
                         pct_val = ev.get('pct', '?')
                         action = ev.get('action', '?')
-                        print(f"[context] {pct_val}% -- {action}  [{label}]")
+                        print(f'[context] {pct_val}% -- {action}  [{label}]')
                         continue
 
                     tag = ev.get('tag', '?')
@@ -471,12 +478,14 @@ def start_chat_listener(ws_conn, label, on_switch, on_rename=None, on_dead=None)
                     cls_short = cls[:80] + '...' if len(cls) > 80 else cls
                     text_short = text[:40] + '...' if len(text) > 40 else text
 
-                    prefix = '>>> SWITCH' if is_switch else ('>>> RENAME' if is_rename else '          ')
-                    line = f"[dom] {prefix}  {ev_type.upper():8s}  [{label}]  <{tag}> .{cls_short}"
+                    prefix = (
+                        '>>> SWITCH' if is_switch else ('>>> RENAME' if is_rename else '          ')
+                    )
+                    line = f'[dom] {prefix}  {ev_type.upper():8s}  [{label}]  <{tag}> .{cls_short}'
                     if text_short:
-                        line += f"\n[dom]               text: \"{text_short}\""
+                        line += f'\n[dom]               text: "{text_short}"'
                     if chat:
-                        line += f"\n[dom]               chat: {chat.get('name', '?')}  (pc_id={chat.get('pc_id', '?')})"
+                        line += f'\n[dom]               chat: {chat.get("name", "?")}  (pc_id={chat.get("pc_id", "?")})'
                     print(line)
 
                     if not chat:
@@ -488,7 +497,7 @@ def start_chat_listener(ws_conn, label, on_switch, on_rename=None, on_dead=None)
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
         except Exception as e:
-            print(f"[dom] Listener ended: {label} ({e})")
+            print(f'[dom] Listener ended: {label} ({e})')
             if on_dead:
                 on_dead(label, e)
 
@@ -508,6 +517,6 @@ def list_chats(eval_fn):
     try:
         parsed = json.loads(result) if result else []
     except (json.JSONDecodeError, TypeError) as e:
-        print(f"[chat_detection] list_chats parse error: {e}")
+        print(f'[chat_detection] list_chats parse error: {e}')
         raise
     return parsed if isinstance(parsed, list) else []

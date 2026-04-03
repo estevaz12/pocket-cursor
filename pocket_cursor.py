@@ -10,7 +10,9 @@ Connects to Cursor via Chrome DevTools Protocol (CDP).
 Usage: python -X utf8 pocket_cursor.py
 """
 
-import sys, io
+import io
+import sys
+
 if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -18,6 +20,7 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
 # Standard library
 import atexit
 import base64
+import hashlib
 import json
 import os
 import re
@@ -26,18 +29,21 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
-
-# Sibling modules
-from start_cursor import get_used_ports
-from chat_detection import install_chat_listener, start_chat_listener, list_chats, ts_print
-from lib import command_rules
 
 # Third-party
 import requests
 import websocket
 from openai import OpenAI
 from PIL import Image
+
+from chat_detection import install_chat_listener, list_chats, start_chat_listener, ts_print
+from lib import command_rules
+from lib.observability import init_sentry
+
+# Sibling modules
+from start_cursor import discover_cdp_ports
 
 print = ts_print
 
@@ -53,10 +59,12 @@ if env_path.exists():
 
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN:
-    print("ERROR: TELEGRAM_BOT_TOKEN not set.")
+    print('ERROR: TELEGRAM_BOT_TOKEN not set.')
     sys.exit(1)
 
-TG_API = f"https://api.telegram.org/bot{TOKEN}"
+init_sentry()
+
+TG_API = f'https://api.telegram.org/bot{TOKEN}'
 
 # OpenAI API for voice transcription (optional)
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
@@ -72,18 +80,18 @@ COMMAND_RULES = os.environ.get('COMMAND_RULES', '').lower() in ('true', '1', 'ye
 
 # Owner lock: only respond to this Telegram user ID
 # Set in .env or auto-captured on first /start command
-OWNER_ID = os.environ.get('TELEGRAM_OWNER_ID')
-OWNER_ID = int(OWNER_ID) if OWNER_ID else None
+_owner_raw = os.environ.get('TELEGRAM_OWNER_ID')
+OWNER_ID: int | None = int(_owner_raw) if _owner_raw else None
 owner_file = Path(__file__).parent / '.owner_id'
 chat_id_file = Path(__file__).parent / '.chat_id'
 
 # Shared state
 cdp_lock = threading.Lock()
-ws = None                    # Active instance's WebSocket (all cdp_* functions use this)
-_browser_ws_url = None       # Browser-level WebSocket URL (cached at connect time)
-instance_registry = {}       # {target_id: {workspace, ws, ws_url, title}}
-active_instance_id = None    # Which instance ws points to
-mirrored_chat = None         # (instance_id, pc_id, chat_name) — the ONE chat being mirrored
+ws = None  # Active instance's WebSocket (all cdp_* functions use this)
+_browser_ws_url = None  # Browser-level WebSocket URL (cached at connect time)
+instance_registry: dict[Any, Any] = {}  # {target_id: {workspace, ws, ws_url, title}}
+active_instance_id = None  # Which instance ws points to
+mirrored_chat = None  # (instance_id, pc_id, chat_name) — the ONE chat being mirrored
 # Load chat_id from disk so PC messages work after restart without a Telegram message first
 chat_id = int(chat_id_file.read_text().strip()) if chat_id_file.exists() else None
 chat_id_lock = threading.Lock()
@@ -97,31 +105,42 @@ phone_outbox = Path(__file__).parent / '_phone_outbox'
 last_sent_text = None  # Last message sent by the sender thread
 last_sent_lock = threading.Lock()
 last_tg_message_id = None  # Message ID of the last Telegram message (for reactions)
-pending_confirms = {}  # {tool_call_id: {buttons_selector, buttons: [{label, index}]}} for inline keyboards
+pending_confirms: dict[Any, Any] = {}  # {short_cb_key: {...}} for inline keyboards
 pending_confirms_lock = threading.Lock()
+
+
+def _confirm_callback_key(tool_id: str) -> str:
+    """Stable short key for Telegram callback_data (max 64 bytes total per button)."""
+    h = hashlib.sha256(str(tool_id).encode('utf-8')).hexdigest()[:16]
+    return h
 
 
 def _save_active_chat(workspace, chat_name, pc_id):
     """Persist active chat state."""
     try:
-        active_chat_file.write_text(json.dumps({
-            'workspace': workspace,
-            'chat_name': chat_name,
-            'pc_id': pc_id,
-        }))
+        active_chat_file.write_text(
+            json.dumps(
+                {
+                    'workspace': workspace,
+                    'chat_name': chat_name,
+                    'pc_id': pc_id,
+                }
+            )
+        )
     except Exception:
         pass
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────────────
 
+
 def tg_call(method, **params):
-    resp = requests.post(f"{TG_API}/{method}", json=params, timeout=60)
+    resp = requests.post(f'{TG_API}/{method}', json=params, timeout=60)
     result = resp.json()
     if not result.get('ok'):
         desc = result.get('description', '?')
         code = result.get('error_code', '?')
-        print(f"[telegram] API error: {method} -> {code} {desc}")
+        print(f'[telegram] API error: {method} -> {code} {desc}')
     return result
 
 
@@ -175,11 +194,13 @@ def tg_send_thinking(cid, text):
         result = tg_call('sendMessage', chat_id=cid, text=msg, parse_mode='MarkdownV2')
         if result.get('ok'):
             return result
-        print(f"[telegram] MarkdownV2 failed: {result.get('description', '?')}, falling back to plain text")
+        print(
+            f'[telegram] MarkdownV2 failed: {result.get("description", "?")}, falling back to plain text'
+        )
     except Exception as e:
-        print(f"[telegram] MarkdownV2 error: {e}, falling back to plain text")
+        print(f'[telegram] MarkdownV2 error: {e}, falling back to plain text')
     # Fallback: plain text with prefix
-    return tg_call('sendMessage', chat_id=cid, text=f"💭 {text}")
+    return tg_call('sendMessage', chat_id=cid, text=f'💭 {text}')
 
 
 def tg_send_photo(cid, photo_path, caption=None):
@@ -191,15 +212,15 @@ def tg_send_photo(cid, photo_path, caption=None):
             data = {'chat_id': cid}
             if caption:
                 data['caption'] = caption[:1024]  # Telegram caption limit
-            resp = requests.post(f"{TG_API}/sendPhoto", data=data, files={'photo': f}, timeout=30)
+            resp = requests.post(f'{TG_API}/sendPhoto', data=data, files={'photo': f}, timeout=30)
             result = resp.json()
             if not result.get('ok'):
                 desc = result.get('description', '?')
                 code = result.get('error_code', '?')
-                print(f"[telegram] sendPhoto failed: {code} {desc}  ({photo_path})")
+                print(f'[telegram] sendPhoto failed: {code} {desc}  ({photo_path})')
             return result
     except Exception as e:
-        print(f"[telegram] sendPhoto error: {e}")
+        print(f'[telegram] sendPhoto error: {e}')
         return None
 
 
@@ -211,20 +232,26 @@ def tg_send_photo_bytes(cid, photo_bytes, filename='screenshot.png', caption=Non
         data = {'chat_id': cid}
         if caption:
             data['caption'] = caption[:1024]
-        resp = requests.post(f"{TG_API}/sendPhoto", data=data,
-                             files={'photo': (filename, photo_bytes, 'image/png')}, timeout=30)
+        resp = requests.post(
+            f'{TG_API}/sendPhoto',
+            data=data,
+            files={'photo': (filename, photo_bytes, 'image/png')},
+            timeout=30,
+        )
         result = resp.json()
         if not result.get('ok'):
             desc = result.get('description', '?')
             code = result.get('error_code', '?')
-            print(f"[telegram] sendPhoto failed: {code} {desc}  ({len(photo_bytes)} bytes)")
+            print(f'[telegram] sendPhoto failed: {code} {desc}  ({len(photo_bytes)} bytes)')
         return result
     except Exception as e:
-        print(f"[telegram] sendPhoto bytes error: {e}")
+        print(f'[telegram] sendPhoto bytes error: {e}')
         return None
 
 
-def tg_send_photo_bytes_with_keyboard(cid, photo_bytes, keyboard, filename='screenshot.png', caption=None):
+def tg_send_photo_bytes_with_keyboard(
+    cid, photo_bytes, keyboard, filename='screenshot.png', caption=None
+):
     """Send photo with inline keyboard buttons."""
     if not cid or not photo_bytes:
         return None
@@ -233,16 +260,22 @@ def tg_send_photo_bytes_with_keyboard(cid, photo_bytes, keyboard, filename='scre
         if caption:
             data['caption'] = caption[:1024]
         data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
-        resp = requests.post(f"{TG_API}/sendPhoto", data=data,
-                             files={'photo': (filename, photo_bytes, 'image/png')}, timeout=30)
+        resp = requests.post(
+            f'{TG_API}/sendPhoto',
+            data=data,
+            files={'photo': (filename, photo_bytes, 'image/png')},
+            timeout=30,
+        )
         result = resp.json()
         if not result.get('ok'):
             desc = result.get('description', '?')
             code = result.get('error_code', '?')
-            print(f"[telegram] sendPhoto+keyboard failed: {code} {desc}  ({len(photo_bytes)} bytes)")
+            print(
+                f'[telegram] sendPhoto+keyboard failed: {code} {desc}  ({len(photo_bytes)} bytes)'
+            )
         return result
     except Exception as e:
-        print(f"[telegram] sendPhoto+keyboard error: {e}")
+        print(f'[telegram] sendPhoto+keyboard error: {e}')
         return None
 
 
@@ -282,21 +315,30 @@ def tg_register_commands():
         merged.extend(POCKET_CURSOR_COMMANDS)
         result = tg_call('setMyCommands', commands=merged)
         ok = result.get('ok', False)
-        print(f"[telegram] Registered {len(POCKET_CURSOR_COMMANDS)} commands (total {len(merged)}): {'OK' if ok else result}")
+        print(
+            f'[telegram] Registered {len(POCKET_CURSOR_COMMANDS)} commands (total {len(merged)}): {"OK" if ok else result}'
+        )
         return ok
     except Exception as e:
-        print(f"[telegram] Failed to register commands: {e}")
+        print(f'[telegram] Failed to register commands: {e}')
         return False
 
 
 def tg_ask_command_update(cid):
     """Send an inline keyboard asking the user to update bot commands."""
-    tg_call('sendMessage', chat_id=cid,
-            text="New commands available. Want me to update your Telegram bot menu?",
-            reply_markup={'inline_keyboard': [
-                [{'text': '✅ Yes, update', 'callback_data': 'setup_commands:yes'},
-                 {'text': 'Skip', 'callback_data': 'setup_commands:no'}]
-            ]})
+    tg_call(
+        'sendMessage',
+        chat_id=cid,
+        text='New commands available. Want me to update your Telegram bot menu?',
+        reply_markup={
+            'inline_keyboard': [
+                [
+                    {'text': '✅ Yes, update', 'callback_data': 'setup_commands:yes'},
+                    {'text': 'Skip', 'callback_data': 'setup_commands:no'},
+                ]
+            ]
+        },
+    )
 
 
 def vscode_url_to_path(url):
@@ -324,32 +366,37 @@ def transcribe_voice(audio_bytes, filename='voice.ogg'):
         )
         return result.text
     except Exception as e:
-        print(f"[transcribe] Error: {e}")
+        print(f'[transcribe] Error: {e}')
         return None
 
 
 # ── CDP helpers ──────────────────────────────────────────────────────────────
 
+
 def detect_cdp_port(exit_on_fail=True):
-    return 9222
     """Auto-detect the CDP port from running Cursor processes.
-    
-    Uses start_cursor.get_used_ports() to parse process command lines,
-    then verifies each port actually responds.  On Windows, merged windows
-    leave ghost --remote-debugging-port entries in the launcher process's
-    command line even though only the original port is bound.
-    
+
+    Uses start_cursor.discover_cdp_ports() (WMIC + PowerShell command lines on
+    Windows, then localhost /json scan if needed). Verifies each candidate
+    responds. On Windows, merged windows can leave ghost --remote-debugging-port
+    entries in the launcher process even though only the original port is bound.
+
     When exit_on_fail=False (used by background threads), returns None
     instead of calling sys.exit() so the caller can retry next cycle.
     """
-    ports = get_used_ports()
+    ports, probed = discover_cdp_ports()
     if not ports:
         if exit_on_fail:
-            print("ERROR: No Cursor process with CDP detected.")
-            print("Start Cursor with CDP first:  python start_cursor.py")
-            print("Or check status:              python start_cursor.py --check")
+            print('ERROR: No Cursor process with CDP detected.')
+            print('Start Cursor with CDP first:  python start_cursor.py')
+            print('Or check status:              python start_cursor.py --check')
             sys.exit(1)
         return None
+    if probed:
+        print(
+            '[cdp] CDP port from localhost scan (command-line enumeration had no '
+            'flags — e.g. WMIC unavailable on newer Windows).'
+        )
     for port in ports:
         try:
             resp = requests.get(f'http://localhost:{port}/json', timeout=2)
@@ -358,22 +405,22 @@ def detect_cdp_port(exit_on_fail=True):
         except Exception:
             pass
     if exit_on_fail:
-        print("ERROR: Cursor process found but no CDP port is responding.")
-        print(f"Ports in command line: {ports}")
-        print("Start Cursor with CDP first:  python start_cursor.py")
+        print('ERROR: Cursor process found but no CDP port is responding.')
+        print(f'Ports in command line: {ports}')
+        print('Start Cursor with CDP first:  python start_cursor.py')
         sys.exit(1)
     return None
 
 
 def parse_instance_title(title):
     """Extract workspace name from a Cursor instance title.
-    
+
     Title patterns:
         "Cursor"                                              → no workspace
         "file.py - WorkspaceName - Cursor"                    → "WorkspaceName"
         "file.md - Name (Workspace) - Cursor"                 → "Name (Workspace)"
         "Interactive - file.py - WorkspaceName - Cursor"      → "WorkspaceName"
-    
+
     Workspace is always the second-to-last segment before "- Cursor".
     """
     parts = title.split(' - ')
@@ -384,7 +431,7 @@ def parse_instance_title(title):
 
 def cdp_list_instances(port=None):
     """List all Cursor instances on the CDP port.
-    
+
     Returns list of dicts: {id, title, workspace, ws_url}
     Instances without a workspace (e.g. "select workspace" screen) get workspace=None.
     """
@@ -397,12 +444,14 @@ def cdp_list_instances(port=None):
             continue
         if t.get('url', '').startswith('devtools://'):
             continue
-        instances.append({
-            'id': t['id'],
-            'title': t.get('title', ''),
-            'workspace': parse_instance_title(t.get('title', '')),
-            'ws_url': t['webSocketDebuggerUrl'],
-        })
+        instances.append(
+            {
+                'id': t['id'],
+                'title': t.get('title', ''),
+                'workspace': parse_instance_title(t.get('title', '')),
+                'ws_url': t['webSocketDebuggerUrl'],
+            }
+        )
     return instances
 
 
@@ -449,7 +498,7 @@ def _handle_chat_switch(iid, data):
         cur_pc_id = mirrored_chat[1] if mirrored_chat else None
         if iid == cur_iid and pc_id == cur_pc_id:
             return
-        same_chat_new_window = (pc_id == cur_pc_id and iid != cur_iid)
+        same_chat_new_window = pc_id == cur_pc_id and iid != cur_iid
         mirrored_chat = (iid, pc_id, name)
     if iid != active_instance_id:
         with cdp_lock:
@@ -459,7 +508,7 @@ def _handle_chat_switch(iid, data):
     info = instance_registry.get(iid, {})
     ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
     is_provisional = pc_id.startswith('pc-')
-    print(f"[dom] Active: {name}  in {ws_label}" + (" (provisional)" if is_provisional else ""))
+    print(f'[dom] Active: {name}  in {ws_label}' + (' (provisional)' if is_provisional else ''))
     # Seed the overview's known_convs so it can detect renames.
     # Without this, a new chat created and auto-renamed before the next
     # overview scan would never be seen under its original name ("New Chat").
@@ -479,9 +528,9 @@ def _handle_chat_switch(iid, data):
                     pre = _switch_debounce_pre_pcid
                     _switch_debounce_pre_pcid = None
                 if pre == pid:
-                    print(f"[dom] Suppressed notification (returned to same chat: {n})")
+                    print(f'[dom] Suppressed notification (returned to same chat: {n})')
                     return
-                _send_chat_activated_telegram(f"💬 Chat activated: {n}  ({wsl})")
+                _send_chat_activated_telegram(f'💬 Chat activated: {n}  ({wsl})')
 
             _switch_debounce_timer = threading.Timer(1.5, _fire)
             _switch_debounce_timer.start()
@@ -515,7 +564,7 @@ def _on_listener_dead(label, exc):
         ws_label = info.get('workspace') or '(no workspace)'
         if ws_label == label or label == ws_label:
             info['listener_dead'] = True
-            print(f"[overview] Listener dead for {label}, will reconnect on next scan")
+            print(f'[overview] Listener dead for {label}, will reconnect on next scan')
             return
 
 
@@ -524,7 +573,8 @@ def _setup_chat_listener(iid, ws_url, label):
     listener_conn = websocket.create_connection(ws_url)
     install_chat_listener(listener_conn)
     start_chat_listener(
-        listener_conn, label,
+        listener_conn,
+        label,
         on_switch=lambda data: _handle_chat_switch(iid, data),
         on_rename=lambda data: _handle_chat_rename(iid, data),
         on_dead=_on_listener_dead,
@@ -563,12 +613,14 @@ def _build_context_annotation(ctx, pc_id):
     if ctx is None:
         return None
     prev = _context_pcts.get(pc_id)
-    hint = "(see pocket-cursor.mdc § Context monitor)"
+    hint = '(see pocket-cursor.mdc § Context monitor)'
     if prev is not None and prev - ctx > 5:
-        return (f"[ContextMonitor: context was summarized "
-                f"({int(prev)}% -> {int(ctx)}%) -- check your journal {hint}]")
+        return (
+            f'[ContextMonitor: context was summarized '
+            f'({int(prev)}% -> {int(ctx)}%) -- check your journal {hint}]'
+        )
     if ctx >= CONTEXT_MONITOR_THRESHOLD:
-        return f"[ContextMonitor: {int(ctx)}% context used -- journal reminder {hint}]"
+        return f'[ContextMonitor: {int(ctx)}% context used -- journal reminder {hint}]'
     return None
 
 
@@ -576,17 +628,17 @@ def cdp_connect():
     """Connect to all Cursor instances. Restores the last active chat from .active_chat, or defaults to the first instance with a workspace."""
     global ws, instance_registry, active_instance_id, mirrored_chat, _browser_ws_url
     port = detect_cdp_port()
-    print(f"[cdp] Using port {port}")
+    print(f'[cdp] Using port {port}')
     try:
         binfo = requests.get(f'http://localhost:{port}/json/version', timeout=3).json()
         _browser_ws_url = binfo.get('webSocketDebuggerUrl')
-        print(f"[cdp] Browser WS: {_browser_ws_url}")
+        print(f'[cdp] Browser WS: {_browser_ws_url}')
     except Exception:
         _browser_ws_url = None
     instances = cdp_list_instances(port)
 
     if not instances:
-        print("ERROR: No Cursor instances found on CDP port.")
+        print('ERROR: No Cursor instances found on CDP port.')
         sys.exit(1)
 
     instance_registry.clear()
@@ -603,21 +655,28 @@ def cdp_connect():
                 'listener_ws': listener_conn,
                 'convs': {},
             }
-            print(f"[cdp] Connected: {label}  [{w['id'][:8]}]")
+            print(f'[cdp] Connected: {label}  [{w["id"][:8]}]')
         except Exception as e:
-            print(f"[cdp] Failed to connect to {label}: {e}")
+            print(f'[cdp] Failed to connect to {label}: {e}')
 
     if not instance_registry:
-        print("ERROR: Could not connect to any Cursor instance.")
+        print('ERROR: Could not connect to any Cursor instance.')
         sys.exit(1)
 
     for iid, info in instance_registry.items():
         if info['workspace']:
             try:
                 convs = list_chats(lambda js, c=info['ws']: cdp_eval_on(c, js))
-                info['convs'] = {c['pc_id']: {'name': c['name'], 'active': c['active'], 'msg_id': c.get('msg_id')} for c in convs}
+                info['convs'] = {
+                    c['pc_id']: {
+                        'name': c['name'],
+                        'active': c['active'],
+                        'msg_id': c.get('msg_id'),
+                    }
+                    for c in convs
+                }
                 names = [c['name'] for c in convs]
-                print(f"[cdp] Conversations in {info['workspace']}: {names}")
+                print(f'[cdp] Conversations in {info["workspace"]}: {names}')
             except Exception:
                 pass
 
@@ -637,7 +696,7 @@ def cdp_connect():
                         if pc_id == saved_pc_id or conv['name'] == saved_name:
                             active_instance_id = wid
                             mirrored_chat = (wid, pc_id, conv['name'])
-                            print(f"[cdp] Active (restored): {info['workspace']} -- {conv['name']}")
+                            print(f'[cdp] Active (restored): {info["workspace"]} -- {conv["name"]}')
                             break
                 if active_instance_id:
                     break
@@ -647,10 +706,10 @@ def cdp_connect():
     if not active_instance_id:
         active_instance_id = next(
             (wid for wid, info in instance_registry.items() if info['workspace']),
-            next(iter(instance_registry))
+            next(iter(instance_registry)),
         )
         active_name = instance_registry[active_instance_id]['workspace'] or '(no workspace)'
-        print(f"[cdp] Active (default): {active_name}")
+        print(f'[cdp] Active (default): {active_name}')
     ws = instance_registry[active_instance_id]['ws']
 
 
@@ -665,11 +724,15 @@ def cdp_eval_on(conn, expression):
         msg_id_counter += 1
         mid = msg_id_counter
     with cdp_lock:
-        conn.send(json.dumps({
-            'id': mid,
-            'method': 'Runtime.evaluate',
-            'params': {'expression': expression, 'returnByValue': True}
-        }))
+        conn.send(
+            json.dumps(
+                {
+                    'id': mid,
+                    'method': 'Runtime.evaluate',
+                    'params': {'expression': expression, 'returnByValue': True},
+                }
+            )
+        )
         result = json.loads(conn.recv())
     return result.get('result', {}).get('result', {}).get('value')
 
@@ -708,6 +771,7 @@ def _win32_force_foreground(title):
     """
     import ctypes
     import ctypes.wintypes as wt
+
     user32 = ctypes.windll.user32
 
     hwnd = user32.FindWindowW(None, title)
@@ -719,8 +783,12 @@ def _win32_force_foreground(title):
     # HWND is a pointer (c_void_p). Without argtypes, ctypes truncates
     # -1 to 32-bit c_int which SetWindowPos silently ignores.
     user32.SetWindowPos.argtypes = [
-        wt.HWND, wt.HWND,
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wt.HWND,
+        wt.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
         ctypes.c_uint,
     ]
     user32.SetWindowPos.restype = wt.BOOL
@@ -738,12 +806,12 @@ def _win32_force_foreground(title):
         return True
 
     # Fallback: minimize/restore (causes brief flicker but guaranteed)
-    print(f"[cdp] bring_to_front: SetWindowPos failed ({r1},{r2}), trying minimize/restore")
-    user32.ShowWindow(hwnd, 6)   # SW_MINIMIZE
+    print(f'[cdp] bring_to_front: SetWindowPos failed ({r1},{r2}), trying minimize/restore')
+    user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
     time.sleep(0.05)
-    user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
     user32.SetForegroundWindow(hwnd)
-    print(f"[cdp] bring_to_front: minimize/restore  hwnd={hwnd}")
+    print(f'[cdp] bring_to_front: minimize/restore  hwnd={hwnd}')
     return True
 
 
@@ -755,7 +823,7 @@ def cdp_bring_to_front(conn, target_id=None):
       2. Target.activateTarget on browser-level WS (activates the tab in Chrome)
       3. OS-specific: Win32 SetWindowPos | macOS osascript | Linux xdotool
     """
-    print(f"[cdp] bring_to_front: Page.bringToFront + window.focus()  target={target_id}")
+    print(f'[cdp] bring_to_front: Page.bringToFront + window.focus()  target={target_id}')
     _cdp_cmd(conn, 'Page.bringToFront')
     cdp_eval_on(conn, 'window.focus()')
 
@@ -763,36 +831,47 @@ def cdp_bring_to_front(conn, target_id=None):
         try:
             browser_conn = websocket.create_connection(_browser_ws_url)
             try:
-                browser_conn.send(json.dumps({
-                    'id': 1, 'method': 'Target.activateTarget',
-                    'params': {'targetId': target_id}
-                }))
+                browser_conn.send(
+                    json.dumps(
+                        {
+                            'id': 1,
+                            'method': 'Target.activateTarget',
+                            'params': {'targetId': target_id},
+                        }
+                    )
+                )
                 result = json.loads(browser_conn.recv())
                 if result.get('error'):
-                    print(f"[cdp] bring_to_front: Target.activateTarget FAILED: {result['error']}")
+                    print(f'[cdp] bring_to_front: Target.activateTarget FAILED: {result["error"]}')
                 else:
-                    print(f"[cdp] bring_to_front: Target.activateTarget OK  target={target_id[:8]}")
+                    print(f'[cdp] bring_to_front: Target.activateTarget OK  target={target_id[:8]}')
             finally:
                 browser_conn.close()
         except Exception as e:
-            print(f"[cdp] bring_to_front: Target.activateTarget exception: {e}")
+            print(f'[cdp] bring_to_front: Target.activateTarget exception: {e}')
 
     try:
         title = cdp_eval_on(conn, 'document.title')
         if not title:
-            print(f"[cdp] bring_to_front: document.title was empty")
+            print('[cdp] bring_to_front: document.title was empty')
         elif sys.platform == 'win32':
             _win32_force_foreground(title)
         elif sys.platform == 'darwin':
-            sp.Popen(['osascript', '-e', 'tell application "Cursor" to activate'],
-                      stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-            print(f"[cdp] bring_to_front: osascript activate")
+            sp.Popen(
+                ['osascript', '-e', 'tell application "Cursor" to activate'],
+                stdout=sp.DEVNULL,
+                stderr=sp.DEVNULL,
+            )
+            print('[cdp] bring_to_front: osascript activate')
         elif sys.platform.startswith('linux'):
-            sp.Popen(['xdotool', 'search', '--name', title, 'windowactivate'],
-                      stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-            print(f"[cdp] bring_to_front: xdotool windowactivate")
+            sp.Popen(
+                ['xdotool', 'search', '--name', title, 'windowactivate'],
+                stdout=sp.DEVNULL,
+                stderr=sp.DEVNULL,
+            )
+            print('[cdp] bring_to_front: xdotool windowactivate')
     except Exception as e:
-        print(f"[cdp] bring_to_front: OS fallback exception: {e}")
+        print(f'[cdp] bring_to_front: OS fallback exception: {e}')
 
 
 def cdp_insert_text(text):
@@ -802,11 +881,7 @@ def cdp_insert_text(text):
         msg_id_counter += 1
         mid = msg_id_counter
     with cdp_lock:
-        ws.send(json.dumps({
-            'id': mid,
-            'method': 'Input.insertText',
-            'params': {'text': text}
-        }))
+        ws.send(json.dumps({'id': mid, 'method': 'Input.insertText', 'params': {'text': text}}))
         json.loads(ws.recv())
 
 
@@ -817,11 +892,9 @@ def cdp_screenshot_on(conn):
         msg_id_counter += 1
         mid = msg_id_counter
     with cdp_lock:
-        conn.send(json.dumps({
-            'id': mid,
-            'method': 'Page.captureScreenshot',
-            'params': {'format': 'png'}
-        }))
+        conn.send(
+            json.dumps({'id': mid, 'method': 'Page.captureScreenshot', 'params': {'format': 'png'}})
+        )
         result = json.loads(conn.recv())
     b64 = result.get('result', {}).get('data')
     return base64.b64decode(b64) if b64 else None
@@ -841,44 +914,47 @@ def cdp_hover_file_path(filename_selector):
     """
     try:
         conn = active_conn()
-        pos = cdp_eval_on(conn, f"""
+        pos = cdp_eval_on(
+            conn,
+            f"""
             (() => {{
                 const el = document.querySelector('{filename_selector}');
                 if (!el) return null;
                 const r = el.getBoundingClientRect();
                 return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
             }})();
-        """)
+        """,
+        )
         if not pos:
             return None
         box = json.loads(pos)
 
         # Hover over filename to trigger tooltip
-        _cdp_cmd(conn, 'Input.dispatchMouseEvent', {
-            'type': 'mouseMoved',
-            'x': int(box['x']),
-            'y': int(box['y'])
-        })
+        _cdp_cmd(
+            conn,
+            'Input.dispatchMouseEvent',
+            {'type': 'mouseMoved', 'x': int(box['x']), 'y': int(box['y'])},
+        )
 
         # Poll for tooltip (typically appears within 50-100ms)
         tooltip = None
         deadline = time.time() + 1.0
         while time.time() < deadline:
-            tooltip = cdp_eval_on(conn, """
+            tooltip = cdp_eval_on(
+                conn,
+                """
                 (() => {
                     const hover = document.querySelector('.workbench-hover-container .hover-contents');
                     return hover ? hover.textContent.trim() : null;
                 })();
-            """)
+            """,
+            )
             if tooltip:
                 break
             time.sleep(0.05)
 
         # Move mouse away to dismiss tooltip
-        _cdp_cmd(conn, 'Input.dispatchMouseEvent', {
-            'type': 'mouseMoved',
-            'x': 0, 'y': 0
-        })
+        _cdp_cmd(conn, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': 0, 'y': 0})
         time.sleep(0.1)
 
         if not tooltip:
@@ -889,7 +965,7 @@ def cdp_hover_file_path(filename_selector):
             return parts[1].replace('\\', '/')
         return tooltip.replace('\\', '/')
     except Exception as e:
-        print(f"[monitor] cdp_hover_file_path error: {e}")
+        print(f'[monitor] cdp_hover_file_path error: {e}')
         return None
 
 
@@ -919,10 +995,10 @@ def cdp_try_expand(selector):
             time.sleep(0.5)
             return True
         if result not in ('no_btn', 'not_collapsed'):
-            print(f"[screenshot] try_expand: {result}")
+            print(f'[screenshot] try_expand: {result}')
         return False
     except Exception as e:
-        print(f"[screenshot] try_expand error: {e}")
+        print(f'[screenshot] try_expand error: {e}')
         return False
 
 
@@ -943,12 +1019,12 @@ def cdp_try_collapse(selector):
         """)
         time.sleep(0.3)
     except Exception as e:
-        print(f"[screenshot] try_collapse error: {e}")
+        print(f'[screenshot] try_collapse error: {e}')
 
 
 def cdp_screenshot_element(selector):
     """Screenshot a specific DOM element by CSS selector. Returns PNG bytes or None.
-    
+
     Takes a full screenshot (which works reliably), then crops the element
     region using Pillow. Sidesteps CDP clip coordinate/DPR issues entirely.
     """
@@ -962,7 +1038,7 @@ def cdp_screenshot_element(selector):
         }})();
     """)
     if not found:
-        print(f"[screenshot] Element NOT found: {selector}")
+        print(f'[screenshot] Element NOT found: {selector}')
         return None
 
     # Step 2: Wait for scroll to settle
@@ -999,7 +1075,7 @@ def cdp_screenshot_element(selector):
     # Step 4: Take full screenshot
     full_png = cdp_screenshot()
     if not full_png:
-        print("[screenshot] Full screenshot failed")
+        print('[screenshot] Full screenshot failed')
         return None
 
     # Step 5: Crop using Pillow — calculate scale from image size vs viewport
@@ -1020,7 +1096,9 @@ def cdp_screenshot_element(selector):
     right = min(img_w, right)
     bottom = min(img_h, bottom)
 
-    print(f"[screenshot] Crop: {img_w}x{img_h} @ {scale_x:.1f}x -> ({left},{top})-({right},{bottom})")
+    print(
+        f'[screenshot] Crop: {img_w}x{img_h} @ {scale_x:.1f}x -> ({left},{top})-({right},{bottom})'
+    )
 
     cropped = img.crop((left, top, right, bottom))
 
@@ -1040,7 +1118,7 @@ def cdp_screenshot_element(selector):
     buf = io.BytesIO()
     cropped.save(buf, format='PNG')
     png_bytes = buf.getvalue()
-    print(f"[screenshot] Result: {cropped.size[0]}x{cropped.size[1]}, {len(png_bytes)} bytes")
+    print(f'[screenshot] Result: {cropped.size[0]}x{cropped.size[1]}, {len(png_bytes)} bytes')
     return png_bytes
 
 
@@ -1112,6 +1190,7 @@ def cursor_paste_image(image_bytes, mime='image/png', filename='image.png'):
 
 # ── Cursor helpers ───────────────────────────────────────────────────────────
 
+
 def cursor_click_send():
     """Click the send button in Cursor's editor. Used after image paste with no text."""
     return cdp_eval("""
@@ -1137,6 +1216,7 @@ _CONTEXT_PCTS_MAX = 200
 
 _context_pct_names = {}  # {pc_id: str} — chat names from .context_pcts
 
+
 def _load_context_pcts():
     """Load per-chat context % and names from disk."""
     global _context_pct_names
@@ -1144,10 +1224,13 @@ def _load_context_pcts():
         return {}
     try:
         data = json.loads(context_pcts_file.read_text())
-        _context_pct_names = {k: v['name'] for k, v in data.items() if isinstance(v, dict) and 'name' in v}
+        _context_pct_names = {
+            k: v['name'] for k, v in data.items() if isinstance(v, dict) and 'name' in v
+        }
         return {k: v['pct'] for k, v in data.items() if isinstance(v, dict) and 'pct' in v}
     except Exception:
         return {}
+
 
 def _save_context_pcts(pc_id=None, chat_name=None):
     """Persist per-chat context % to disk, pruning to most recent entries."""
@@ -1163,16 +1246,19 @@ def _save_context_pcts(pc_id=None, chat_name=None):
                 entry['name'] = chat_name
             existing[pid] = entry
         if len(existing) > _CONTEXT_PCTS_MAX:
-            sorted_entries = sorted(existing.items(), key=lambda x: x[1].get('ts', ''), reverse=True)
+            sorted_entries = sorted(
+                existing.items(), key=lambda x: x[1].get('ts', ''), reverse=True
+            )
             existing = dict(sorted_entries[:_CONTEXT_PCTS_MAX])
         context_pcts_file.write_text(json.dumps(existing, indent=2))
     except Exception:
         pass
 
+
 if CONTEXT_MONITOR:
     _context_pcts = _load_context_pcts()
     if _context_pcts:
-        print(f"[context-monitor] Restored {len(_context_pcts)} chat(s) from .context_pcts")
+        print(f'[context-monitor] Restored {len(_context_pcts)} chat(s) from .context_pcts')
 else:
     _context_pcts = {}
 
@@ -1187,10 +1273,13 @@ def cursor_prefill_input(text, conn=None):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        c.send(json.dumps({
-            'id': mid,
-            'method': 'Runtime.evaluate',
-            'params': {'expression': """
+        c.send(
+            json.dumps(
+                {
+                    'id': mid,
+                    'method': 'Runtime.evaluate',
+                    'params': {
+                        'expression': """
                 (function() {
                     let editor = document.querySelector('.aislash-editor-input');
                     if (!editor) {
@@ -1204,8 +1293,12 @@ def cursor_prefill_input(text, conn=None):
                     editor.click();
                     return 'OK';
                 })();
-            """, 'returnByValue': True}
-        }))
+            """,
+                        'returnByValue': True,
+                    },
+                }
+            )
+        )
         focus_result = json.loads(c.recv())
         focus_val = focus_result.get('result', {}).get('result', {}).get('value')
         if focus_val != 'OK':
@@ -1214,11 +1307,9 @@ def cursor_prefill_input(text, conn=None):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        c.send(json.dumps({
-            'id': mid,
-            'method': 'Input.insertText',
-            'params': {'text': text + '\n'}
-        }))
+        c.send(
+            json.dumps({'id': mid, 'method': 'Input.insertText', 'params': {'text': text + '\n'}})
+        )
         json.loads(c.recv())
         return 'OK'
 
@@ -1231,10 +1322,13 @@ def cursor_clear_input(conn=None):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        c.send(json.dumps({
-            'id': mid,
-            'method': 'Runtime.evaluate',
-            'params': {'expression': """
+        c.send(
+            json.dumps(
+                {
+                    'id': mid,
+                    'method': 'Runtime.evaluate',
+                    'params': {
+                        'expression': """
                 (function() {
                     let editor = document.querySelector('.aislash-editor-input');
                     if (!editor) {
@@ -1254,8 +1348,12 @@ def cursor_clear_input(conn=None):
                     document.execCommand('delete');
                     return 'CLEARED';
                 })();
-            """, 'returnByValue': True}
-        }))
+            """,
+                        'returnByValue': True,
+                    },
+                }
+            )
+        )
         json.loads(c.recv())
 
 
@@ -1266,7 +1364,7 @@ def cursor_send_message(text, raw=False):
     """
     if not raw:
         timestamp = datetime.now().strftime('%a %Y-%m-%d %H:%M')
-        text = f"[{timestamp}] [Phone] {text}"
+        text = f'[{timestamp}] [Phone] {text}'
 
     global msg_id_counter
     conn = active_conn()
@@ -1277,10 +1375,13 @@ def cursor_send_message(text, raw=False):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        conn.send(json.dumps({
-            'id': mid,
-            'method': 'Runtime.evaluate',
-            'params': {'expression': """
+        conn.send(
+            json.dumps(
+                {
+                    'id': mid,
+                    'method': 'Runtime.evaluate',
+                    'params': {
+                        'expression': """
                 (function() {
                     let editor = document.querySelector('.aislash-editor-input');
                     if (!editor) {
@@ -1300,8 +1401,12 @@ def cursor_send_message(text, raw=False):
                     sel.addRange(range);
                     return 'OK';
                 })();
-            """, 'returnByValue': True}
-        }))
+            """,
+                        'returnByValue': True,
+                    },
+                }
+            )
+        )
         focus_result = json.loads(conn.recv())
         focus_val = focus_result.get('result', {}).get('result', {}).get('value')
         if focus_val != 'OK':
@@ -1312,11 +1417,7 @@ def cursor_send_message(text, raw=False):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        conn.send(json.dumps({
-            'id': mid,
-            'method': 'Input.insertText',
-            'params': {'text': text}
-        }))
+        conn.send(json.dumps({'id': mid, 'method': 'Input.insertText', 'params': {'text': text}}))
         json.loads(conn.recv())
         t2 = time.time()
 
@@ -1324,10 +1425,13 @@ def cursor_send_message(text, raw=False):
         with msg_id_lock:
             msg_id_counter += 1
             mid = msg_id_counter
-        conn.send(json.dumps({
-            'id': mid,
-            'method': 'Runtime.evaluate',
-            'params': {'expression': """
+        conn.send(
+            json.dumps(
+                {
+                    'id': mid,
+                    'method': 'Runtime.evaluate',
+                    'params': {
+                        'expression': """
                 (function() {
                     let editor = document.querySelector('.aislash-editor-input');
                     if (!editor) {
@@ -1352,13 +1456,19 @@ def cursor_send_message(text, raw=False):
                     }
                     return 'ERROR: no send button';
                 })();
-            """, 'returnByValue': True}
-        }))
+            """,
+                        'returnByValue': True,
+                    },
+                }
+            )
+        )
         send_result = json.loads(conn.recv())
         result = send_result.get('result', {}).get('result', {}).get('value')
 
     t3 = time.time()
-    print(f"[sender] Timing: focus={int((t1-t0)*1000)}ms insert={int((t2-t1)*1000)}ms verify+send={int((t3-t2)*1000)}ms total={int((t3-t0)*1000)}ms")
+    print(
+        f'[sender] Timing: focus={int((t1 - t0) * 1000)}ms insert={int((t2 - t1) * 1000)}ms verify+send={int((t3 - t2) * 1000)}ms total={int((t3 - t0) * 1000)}ms'
+    )
     return result
 
 
@@ -1379,14 +1489,17 @@ def cursor_new_chat():
 
 def cursor_get_active_conv():
     """Get the name of the active conversation tab."""
-    return cdp_eval("""
+    return (
+        cdp_eval("""
         (function() {
             const tab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
             if (tab) return tab.getAttribute('aria-label') || '';
             const unified = document.querySelector('.unified-agents-sidebar .agent-sidebar-cell[data-selected="true"] .agent-sidebar-cell-text');
             return unified ? unified.textContent.trim() : '';
         })();
-    """) or ''
+    """)
+        or ''
+    )
 
 
 def cursor_list_convs():
@@ -1448,14 +1561,14 @@ def cursor_switch_conv(index):
 
 def cursor_get_turn_info(composer_prefix='', conn=None):
     """Get the last turn's user message and all AI response sections.
-    
+
     Uses composer-human-ai-pair-container which groups one user message
     with all its AI responses as a single turn.
     Returns individual sections (not joined) for real-time streaming.
     'turn_id' = unique DOM id of the human message (detects new turns).
     'user_full' = complete user message for forwarding to Telegram.
     'images' = list of vscode-file:// image URLs attached to the message.
-    
+
     If composer_prefix is given (e.g. 'b625b741' from pc_id 'cid-b625b741'),
     scopes the search to the content area with that data-composer-id.
     If conn is given, evaluates on that WebSocket instead of active_conn().
@@ -1533,21 +1646,41 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 if (kind === 'tool') {
                     const toolStatus = msg.getAttribute('data-tool-status');
                     const toolCallId = msg.getAttribute('data-tool-call-id') || '';
-                    // Pending confirmation: find action buttons (may be in status row
-                    // for file edits, or in menu controls for WebFetch/other tools)
-                    const actionBtns = msg.querySelectorAll('[data-click-ready="true"]');
+                    // Pending confirmation: legacy [data-click-ready] OR new ui-shell (Run/Skip)
+                    const bubbleSelector = '#bubble-' + bubbleSuffix;
+                    let actionBtns = msg.querySelectorAll('[data-click-ready="true"]');
+                    let buttonsSelector = bubbleSelector + ' [data-click-ready="true"]';
+                    let selectorForShot = bubbleSelector + ' .composer-tool-former-message > div';
+                    const shellPending = msg.querySelector('.ui-shell-tool-call--pending');
+                    if (actionBtns.length === 0 && shellPending) {
+                        const approvalRow = shellPending.querySelector('.ui-shell-tool-call__approval-row');
+                        if (approvalRow) {
+                            actionBtns = approvalRow.querySelectorAll('button.ui-button');
+                            buttonsSelector = bubbleSelector + ' .ui-shell-tool-call--pending .ui-shell-tool-call__approval-row button.ui-button';
+                            selectorForShot = bubbleSelector + ' .ui-shell-tool-call';
+                        }
+                    }
 
                     if (actionBtns.length > 0) {
-                        // Collect all buttons universally (labels + indices)
                         const buttons = Array.from(actionBtns).map((btn, idx) => ({
                             label: btn.innerText.trim().replace(/\\s+/g, ' '),
                             index: idx
                         }));
 
+                        let cleanText = 'Action pending';
+                        if (shellPending) {
+                            const parts = [];
+                            const descLine = shellPending.querySelector('.ui-shell-tool-call__description');
+                            const summary = shellPending.querySelector('.ui-shell-tool-call__summary');
+                            const cmd = shellPending.querySelector('.ui-shell-tool-call__command');
+                            if (descLine) parts.push(descLine.textContent.trim());
+                            if (summary) parts.push(summary.textContent.trim());
+                            if (cmd) parts.push(cmd.textContent.trim().replace(/\\s+/g, ' '));
+                            cleanText = parts.filter(Boolean).join(' — ') || 'Shell command pending';
+                        } else {
                         const desc = msg.querySelector('.composer-tool-former-message');
                         // Extract text from specific DOM parts, ignoring control row (buttons)
                         // and Monaco diff editors (whose innerText changes async and breaks stability).
-                        let cleanText = 'Action pending';
                         if (desc) {
                             const parts = [];
                             // File edit confirmation: filename + line stats + block status
@@ -1581,13 +1714,13 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             }
                             cleanText = parts.join(' ') || 'Action pending';
                         }
-                        const bubbleSelector = '#bubble-' + bubbleSuffix;
+                        }
                         sections.push({
                             text: cleanText,
                             type: 'confirmation',
                             id: toolCallId || ('gen:' + msgId + ':' + subIdx),
-                            selector: bubbleSelector + ' .composer-tool-former-message > div',
-                            buttons_selector: bubbleSelector + ' [data-click-ready="true"]',
+                            selector: selectorForShot,
+                            buttons_selector: buttonsSelector,
                             buttons: buttons
                         });
                         return;
@@ -1650,6 +1783,41 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                         selector: null
                     });
                     return;
+                }
+
+                // --- New UI: pending shell tool embedded in AI bubble (not always data-message-kind="tool") ---
+                if (msg.getAttribute('data-message-role') === 'ai') {
+                    const shellPending = msg.querySelector('.ui-shell-tool-call--pending');
+                    if (shellPending) {
+                        const approvalRow = shellPending.querySelector('.ui-shell-tool-call__approval-row');
+                        const shellBtns = approvalRow ? approvalRow.querySelectorAll('button.ui-button') : [];
+                        if (shellBtns.length > 0) {
+                            const buttons = Array.from(shellBtns).map((btn, idx) => ({
+                                label: btn.innerText.trim().replace(/\\s+/g, ' '),
+                                index: idx
+                            }));
+                            const parts = [];
+                            const descLine = shellPending.querySelector('.ui-shell-tool-call__description');
+                            const summary = shellPending.querySelector('.ui-shell-tool-call__summary');
+                            const cmd = shellPending.querySelector('.ui-shell-tool-call__command');
+                            if (descLine) parts.push(descLine.textContent.trim());
+                            if (summary) parts.push(summary.textContent.trim());
+                            if (cmd) parts.push(cmd.textContent.trim().replace(/\\s+/g, ' '));
+                            const cleanText = parts.filter(Boolean).join(' — ') || 'Shell command pending';
+                            const bubbleSelector = '#bubble-' + bubbleSuffix;
+                            const nestedId = shellPending.closest('[data-tool-call-id]');
+                            const tid = nestedId ? nestedId.getAttribute('data-tool-call-id') : '';
+                            sections.push({
+                                text: cleanText,
+                                type: 'confirmation',
+                                id: tid || ('gen:' + msgId + ':shell'),
+                                selector: bubbleSelector + ' .ui-shell-tool-call',
+                                buttons_selector: bubbleSelector + ' .ui-shell-tool-call--pending .ui-shell-tool-call__approval-row button.ui-button',
+                                buttons: buttons
+                            });
+                            return;
+                        }
+                    }
                 }
 
                 // --- AI text messages (markdown sections, code blocks + tables) ---
@@ -1756,12 +1924,17 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
     """.replace('__COMPOSER_PREFIX__', composer_prefix)
     result = cdp_eval_on(conn, js) if conn else cdp_eval(js)
     try:
-        return json.loads(result) if result else {'turn_id': '', 'user_full': '', 'sections': [], 'images': [], 'conv': ''}
+        return (
+            json.loads(result)
+            if result
+            else {'turn_id': '', 'user_full': '', 'sections': [], 'images': [], 'conv': ''}
+        )
     except json.JSONDecodeError:
         return {'turn_id': '', 'user_full': '', 'sections': [], 'images': [], 'conv': ''}
 
 
 # ── Thread 1: Telegram → Cursor (sender) ────────────────────────────────────
+
 
 def check_owner(user_id, cid):
     """Check if user_id is the owner. Auto-pair on first /start."""
@@ -1770,7 +1943,7 @@ def check_owner(user_id, cid):
     # Load saved owner if not set
     if OWNER_ID is None and owner_file.exists():
         OWNER_ID = int(owner_file.read_text().strip())
-        print(f"[owner] Loaded owner ID: {OWNER_ID}")
+        print(f'[owner] Loaded owner ID: {OWNER_ID}')
 
     # No owner yet - accept first /start
     if OWNER_ID is None:
@@ -1780,8 +1953,15 @@ def check_owner(user_id, cid):
 
 
 def sender_thread():
-    global chat_id, OWNER_ID, last_sent_text, last_tg_message_id, muted, active_instance_id, mirrored_chat
-    print("[sender] Starting Telegram poller...")
+    global \
+        chat_id, \
+        OWNER_ID, \
+        last_sent_text, \
+        last_tg_message_id, \
+        muted, \
+        active_instance_id, \
+        mirrored_chat
+    print('[sender] Starting Telegram poller...')
 
     # Drain any pending updates from before this restart
     # so we don't re-process old messages
@@ -1789,12 +1969,16 @@ def sender_thread():
     drain = tg_call('getUpdates', offset=0, timeout=0)
     if drain.get('ok') and drain['result']:
         offset = drain['result'][-1]['update_id'] + 1
-        print(f"[sender] Skipped {len(drain['result'])} pending updates")
+        print(f'[sender] Skipped {len(drain["result"])} pending updates')
 
     while True:
         try:
-            updates = tg_call('getUpdates', offset=offset, timeout=30,
-                                allowed_updates=['message', 'callback_query'])
+            updates = tg_call(
+                'getUpdates',
+                offset=offset,
+                timeout=30,
+                allowed_updates=['message', 'callback_query'],
+            )
             if not updates.get('ok'):
                 time.sleep(2)
                 continue
@@ -1808,40 +1992,51 @@ def sender_thread():
                     cb_id = callback.get('id')
                     cb_user_id = callback.get('from', {}).get('id')
 
-                    print(f"[sender] Callback: data={cb_data!r} user={cb_user_id}")
+                    print(f'[sender] Callback: data={cb_data!r} user={cb_user_id}')
 
                     # Only owner can press buttons
                     if OWNER_ID and cb_user_id != OWNER_ID:
-                        print(f"[sender] Callback ignored: not owner ({cb_user_id} != {OWNER_ID})")
+                        print(f'[sender] Callback ignored: not owner ({cb_user_id} != {OWNER_ID})')
                         continue
 
-                    action, _, tool_id = cb_data.partition(':')
+                    action, _, cb_key = cb_data.partition(':')
                     with pending_confirms_lock:
-                        selectors = pending_confirms.pop(tool_id, None)
-                    print(f"[sender] Callback: action={action!r} tool_id={tool_id[:12]}... selectors={'found' if selectors else 'NONE'}")
+                        selectors = pending_confirms.pop(cb_key, None)
+                    print(
+                        f'[sender] Callback: action={action!r} cb_key={cb_key[:16]!r} selectors={"found" if selectors else "NONE"}'
+                    )
 
                     if cb_data == 'noop':
                         tg_call('answerCallbackQuery', callback_query_id=cb_id)
                         continue
 
                     if action == 'setup_commands':
-                        if tool_id == 'yes':
+                        if cb_key == 'yes':
                             ok = tg_register_commands()
-                            tg_call('answerCallbackQuery', callback_query_id=cb_id,
-                                    text='Commands registered!' if ok else 'Failed to register')
+                            tg_call(
+                                'answerCallbackQuery',
+                                callback_query_id=cb_id,
+                                text='Commands registered!' if ok else 'Failed to register',
+                            )
                             # Update the message to remove the buttons
                             cb_msg = callback.get('message', {})
                             if cb_msg:
-                                tg_call('editMessageText', chat_id=cb_msg['chat']['id'],
-                                        message_id=cb_msg['message_id'],
-                                        text='✅ Command menu registered.')
+                                tg_call(
+                                    'editMessageText',
+                                    chat_id=cb_msg['chat']['id'],
+                                    message_id=cb_msg['message_id'],
+                                    text='✅ Command menu registered.',
+                                )
                         else:
                             tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Skipped')
                             cb_msg = callback.get('message', {})
                             if cb_msg:
-                                tg_call('editMessageText', chat_id=cb_msg['chat']['id'],
-                                        message_id=cb_msg['message_id'],
-                                        text='Command menu skipped. You can always add commands later via /setcommands in @BotFather.')
+                                tg_call(
+                                    'editMessageText',
+                                    chat_id=cb_msg['chat']['id'],
+                                    message_id=cb_msg['message_id'],
+                                    text='Command menu skipped. You can always add commands later via /setcommands in @BotFather.',
+                                )
                         continue
 
                     if action in ('agent', 'chat'):
@@ -1851,18 +2046,25 @@ def sender_thread():
                             _, target_iid, target_pc_id = parts
                             info = instance_registry.get(target_iid)
                             if not info:
-                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Instance not found')
+                                tg_call(
+                                    'answerCallbackQuery',
+                                    callback_query_id=cb_id,
+                                    text='Instance not found',
+                                )
                                 continue
                             try:
                                 fresh_rows = list_chats(lambda js: cdp_eval_on(info['ws'], js))
                             except Exception as e:
-                                print(f"[sender] list_chats before chat switch: {e}")
+                                print(f'[sender] list_chats before chat switch: {e}')
                                 fresh_rows = []
                             convs = info.get('convs') or {}
                             if target_pc_id not in convs:
-                                tg_call('answerCallbackQuery', callback_query_id=cb_id,
-                                        text='Chat list outdated — tap /chats then pick again')
-                                print(f"[sender] Unknown pc_id in registry: {target_pc_id!r}")
+                                tg_call(
+                                    'answerCallbackQuery',
+                                    callback_query_id=cb_id,
+                                    text='Chat list outdated — tap /chats then pick again',
+                                )
+                                print(f'[sender] Unknown pc_id in registry: {target_pc_id!r}')
                                 continue
 
                             reg = convs[target_pc_id]
@@ -1871,10 +2073,16 @@ def sender_thread():
                             def _norm_chat_title(s):
                                 return ' '.join((s or '').split()).lower()
 
-                            row = next((r for r in fresh_rows if r.get('pc_id') == target_pc_id), None)
+                            row = next(
+                                (r for r in fresh_rows if r.get('pc_id') == target_pc_id), None
+                            )
                             if not row and reg_name:
                                 row = next(
-                                    (r for r in fresh_rows if (r.get('name') or '').strip() == reg_name),
+                                    (
+                                        r
+                                        for r in fresh_rows
+                                        if (r.get('name') or '').strip() == reg_name
+                                    ),
                                     None,
                                 )
                             if not row and reg_name:
@@ -1885,9 +2093,14 @@ def sender_thread():
                                         break
 
                             if not row:
-                                tg_call('answerCallbackQuery', callback_query_id=cb_id,
-                                        text='Could not find that chat — send /chats and try again')
-                                print(f"[sender] No fresh row for pc_id={target_pc_id!r} name={reg_name!r} (got {len(fresh_rows)} rows)")
+                                tg_call(
+                                    'answerCallbackQuery',
+                                    callback_query_id=cb_id,
+                                    text='Could not find that chat — send /chats and try again',
+                                )
+                                print(
+                                    f'[sender] No fresh row for pc_id={target_pc_id!r} name={reg_name!r} (got {len(fresh_rows)} rows)'
+                                )
                                 continue
 
                             resolved_pc_id = row['pc_id']
@@ -1895,7 +2108,9 @@ def sender_thread():
                             # Click the tab with matching data-pc-id (works for both agent-tabs and editor-group tabs)
                             # Note: filter [data-pc-id] by value so ids never break CSS quoting.
                             # Uses resolved_pc_id from fresh list_chats (ids can rotate when the sidebar rebuilds).
-                            result = cdp_eval_on(info['ws'], f"""
+                            result = cdp_eval_on(
+                                info['ws'],
+                                f"""
                                 (function() {{
                                     const targetPcId = {json.dumps(resolved_pc_id)};
                                     const nameHint = {json.dumps(resolved_name)};
@@ -1957,7 +2172,8 @@ def sender_thread():
                                     const label = el.querySelector('.label-name');
                                     return label ? label.textContent.trim() || 'OK' : 'OK';
                                 }})();
-                            """)
+                            """,
+                            )
                             if result and result.startswith('ERROR'):
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=result)
                             else:
@@ -1965,52 +2181,86 @@ def sender_thread():
                                 if target_iid != active_instance_id:
                                     with cdp_lock:
                                         active_instance_id = target_iid
-                                        ws = info['ws']
-                                    print(f"[sender] Switched instance to: {info['workspace']}")
+                                    print(f'[sender] Switched instance to: {info["workspace"]}')
                                     # Bring the target Cursor window to the foreground via CDP
                                     try:
                                         cdp_bring_to_front(info['ws'], target_iid)
                                     except Exception as e:
-                                        print(f"[sender] Could not bring window to front: {e}")
+                                        print(f'[sender] Could not bring window to front: {e}')
                                 # Update mirrored_chat immediately (don't wait for overview thread)
-                                chat_label = result if result and result != 'OK' else (resolved_name or resolved_pc_id)
+                                chat_label = (
+                                    result
+                                    if result and result != 'OK'
+                                    else (resolved_name or resolved_pc_id)
+                                )
                                 mirrored_chat = (target_iid, resolved_pc_id, chat_label)
-                                ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
-                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
+                                tg_call(
+                                    'answerCallbackQuery', callback_query_id=cb_id, text='Switched'
+                                )
                                 _save_active_chat(info.get('workspace'), chat_label, resolved_pc_id)
-                            print(f"[sender] Agent switch: {result}")
+                            print(f'[sender] Agent switch: {result}')
                         else:
                             # Legacy format: agent:{index}
+                            _legacy = cb_data.split(':', 1)
+                            if len(_legacy) != 2:
+                                tg_call(
+                                    'answerCallbackQuery', callback_query_id=cb_id, text='Invalid'
+                                )
+                                continue
                             try:
-                                idx = int(tool_id)
+                                idx = int(_legacy[1])
                             except ValueError:
-                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Invalid')
+                                tg_call(
+                                    'answerCallbackQuery', callback_query_id=cb_id, text='Invalid'
+                                )
                                 continue
                             result = cursor_switch_conv(idx)
                             if result and result.startswith('ERROR'):
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=result)
                             else:
-                                tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
-                            print(f"[sender] Agent switch: {result}")
+                                tg_call(
+                                    'answerCallbackQuery', callback_query_id=cb_id, text='Switched'
+                                )
+                            print(f'[sender] Agent switch: {result}')
                     elif selectors and action.startswith('btn_'):
                         # Universal button click: action = "btn_INDEX"
                         try:
                             btn_index = int(action.split('_', 1)[1])
                         except (ValueError, IndexError):
-                            tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Invalid button')
+                            tg_call(
+                                'answerCallbackQuery',
+                                callback_query_id=cb_id,
+                                text='Invalid button',
+                            )
                             continue
                         btns_selector = selectors.get('buttons_selector', '')
-                        btn_label = next((b['label'] for b in selectors.get('buttons', []) if b['index'] == btn_index), f'Button {btn_index}')
-                        print(f"[sender] Callback: click button [{btn_index}] '{btn_label}' for tool {tool_id[:12]}...")
-                        click_result = cdp_eval(f"""
+                        btn_label = next(
+                            (
+                                b['label']
+                                for b in selectors.get('buttons', [])
+                                if b['index'] == btn_index
+                            ),
+                            f'Button {btn_index}',
+                        )
+                        print(
+                            f"[sender] Callback: click button [{btn_index}] '{btn_label}' (cb_key={cb_key[:16]})"
+                        )
+                        _iid = selectors.get('instance_id') if selectors else None
+                        _conn = (
+                            instance_registry.get(_iid, {}).get('ws')
+                            if _iid and _iid in instance_registry
+                            else None
+                        )
+                        _js = f"""
                             (function() {{
                                 const btns = document.querySelectorAll('{btns_selector}');
                                 if (!btns[{btn_index}]) return 'ERROR: button ' + {btn_index} + ' not found (' + btns.length + ' buttons)';
                                 btns[{btn_index}].click();
                                 return 'OK';
                             }})();
-                        """)
-                        print(f"[sender] Click result: {click_result}")
+                        """
+                        click_result = cdp_eval_on(_conn, _js) if _conn else cdp_eval(_js)
+                        print(f'[sender] Click result: {click_result}')
                         tg_call('answerCallbackQuery', callback_query_id=cb_id, text=btn_label)
                     else:
                         tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Expired')
@@ -2044,15 +2294,21 @@ def sender_thread():
                     with chat_id_lock:
                         chat_id = cid
                     chat_id_file.write_text(str(cid))
-                    print(f"[owner] Auto-paired with {user} (ID: {user_id})")
-                    tg_send(cid, "🔗 You're in! Messages flow both ways now.\nUse /pause to mute, /play to resume.")
+                    print(f'[owner] Auto-paired with {user} (ID: {user_id})')
+                    tg_send(
+                        cid,
+                        "🔗 You're in! Messages flow both ways now.\nUse /pause to mute, /play to resume.",
+                    )
                     if tg_commands_need_update():
                         tg_ask_command_update(cid)
                     continue
 
                 if status == 'rejected':
-                    print(f"[sender] Rejected message from {user} (ID: {user_id})")
-                    tg_send(cid, "Already paired with someone else.\nIf that's you on another device, send /unpair there first.\n\nWant your own? github.com/qmHecker/pocket-cursor")
+                    print(f'[sender] Rejected message from {user} (ID: {user_id})')
+                    tg_send(
+                        cid,
+                        "Already paired with someone else.\nIf that's you on another device, send /unpair there first.\n\nWant your own? github.com/qmHecker/pocket-cursor",
+                    )
                     continue
 
                 # Store chat_id for the monitor thread (and persist for restarts)
@@ -2062,7 +2318,7 @@ def sender_thread():
 
                 # Handle photo messages (from phone gallery, camera, etc.)
                 if photo:
-                    print(f"[sender] {user}: [photo] {caption}")
+                    print(f'[sender] {user}: [photo] {caption}')
                     tg_typing(cid)
                     # Mark so monitor knows this turn came from Telegram
                     with last_sent_lock:
@@ -2074,18 +2330,23 @@ def sender_thread():
                     file_info = tg_call('getFile', file_id=file_id)
                     if file_info.get('ok'):
                         file_path = file_info['result']['file_path']
-                        dl_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+                        dl_url = f'https://api.telegram.org/file/bot{TOKEN}/{file_path}'
                         img_data = requests.get(dl_url, timeout=30).content
-                        print(f"[sender] Downloaded {len(img_data)} bytes")
+                        print(f'[sender] Downloaded {len(img_data)} bytes')
 
                         # Determine mime type
                         ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else 'jpg'
-                        mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-                                'gif': 'image/gif', 'webp': 'image/webp'}.get(ext, 'image/jpeg')
+                        mime = {
+                            'jpg': 'image/jpeg',
+                            'jpeg': 'image/jpeg',
+                            'png': 'image/png',
+                            'gif': 'image/gif',
+                            'webp': 'image/webp',
+                        }.get(ext, 'image/jpeg')
 
                         # Paste image into Cursor
-                        paste_result = cursor_paste_image(img_data, mime, f"telegram_photo.{ext}")
-                        print(f"[sender] Paste result: {paste_result}")
+                        paste_result = cursor_paste_image(img_data, mime, f'telegram_photo.{ext}')
+                        print(f'[sender] Paste result: {paste_result}')
 
                         # If there's a caption, also insert it as text
                         if caption:
@@ -2096,53 +2357,55 @@ def sender_thread():
                             time.sleep(0.5)
                             cursor_click_send()
                     else:
-                        tg_send(cid, "Failed to download photo from Telegram.")
+                        tg_send(cid, 'Failed to download photo from Telegram.')
                     continue
 
                 # Handle voice messages
                 if voice:
-                    print(f"[sender] {user}: [voice] {voice.get('duration', '?')}s")
+                    print(f'[sender] {user}: [voice] {voice.get("duration", "?")}s')
                     tg_typing(cid)
                     file_id = voice['file_id']
                     file_info = tg_call('getFile', file_id=file_id)
                     if file_info.get('ok'):
                         file_path = file_info['result']['file_path']
-                        dl_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+                        dl_url = f'https://api.telegram.org/file/bot{TOKEN}/{file_path}'
                         audio_data = requests.get(dl_url, timeout=30).content
-                        print(f"[sender] Downloaded voice: {len(audio_data)} bytes")
+                        print(f'[sender] Downloaded voice: {len(audio_data)} bytes')
 
                         # Transcribe
                         transcription = transcribe_voice(audio_data)
                         if transcription:
-                            print(f"[sender] Transcribed: {transcription[:80]}")
+                            print(f'[sender] Transcribed: {transcription[:80]}')
                             # Echo transcription back to Telegram so user sees what was understood
-                            tg_send(cid, f"🎤 {transcription}")
+                            tg_send(cid, f'🎤 {transcription}')
                             # Send to Cursor
                             with last_sent_lock:
                                 last_sent_text = transcription
                                 last_tg_message_id = mid
-                            result = cursor_send_message(f"[Voice] {transcription}")
-                            print(f"[sender] -> Cursor: {result}")
+                            result = cursor_send_message(f'[Voice] {transcription}')
+                            print(f'[sender] -> Cursor: {result}')
                         else:
-                            tg_send(cid, "Could not transcribe voice message. Is OPENAI_API_KEY set?")
+                            tg_send(
+                                cid, 'Could not transcribe voice message. Is OPENAI_API_KEY set?'
+                            )
                     else:
-                        tg_send(cid, "Failed to download voice message.")
+                        tg_send(cid, 'Failed to download voice message.')
                     continue
 
-                print(f"[sender] {user}: {text}")
+                print(f'[sender] {user}: {text}')
 
                 # Handle commands
                 if text == '/start':
                     conv_name = cursor_get_active_conv()
-                    status_line = "⏸ Paused" if muted else "▶ Active"
+                    status_line = '⏸ Paused' if muted else '▶ Active'
                     instances = len(instance_registry)
                     lines = [
-                        f"PocketCursor is running. {status_line}",
-                        f"{instances} workspace{'s' if instances != 1 else ''} connected.",
+                        f'PocketCursor is running. {status_line}',
+                        f'{instances} workspace{"s" if instances != 1 else ""} connected.',
                     ]
                     if conv_name:
-                        lines.append(f"💬 {conv_name}")
-                    lines.append("\n/newchat /chats /pause /play /screenshot /unpair")
+                        lines.append(f'💬 {conv_name}')
+                    lines.append('\n/newchat /chats /pause /play /screenshot /unpair')
                     tg_send(cid, '\n'.join(lines))
                     continue
 
@@ -2150,15 +2413,17 @@ def sender_thread():
                     OWNER_ID = None
                     if owner_file.exists():
                         owner_file.unlink()
-                    tg_send(cid, "👋 Unpaired. Next message from anyone will pair them.")
-                    print(f"[owner] Unpaired")
+                    tg_send(cid, '👋 Unpaired. Next message from anyone will pair them.')
+                    print('[owner] Unpaired')
                     continue
 
                 if text == '/pause':
                     muted = True
                     muted_file.touch()
-                    tg_send(cid, "⏸ Paused. Nothing will be forwarded.\nSend /play when you're ready.")
-                    print("[sender] Paused")
+                    tg_send(
+                        cid, "⏸ Paused. Nothing will be forwarded.\nSend /play when you're ready."
+                    )
+                    print('[sender] Paused')
                     continue
 
                 if text == '/play':
@@ -2166,15 +2431,17 @@ def sender_thread():
                     muted_file.unlink(missing_ok=True)
                     # Include active conversation name in resume message
                     conv_name = cursor_get_active_conv()
-                    resume_msg = "▶ Resumed."
+                    resume_msg = '▶ Resumed.'
                     if conv_name:
-                        resume_msg += f"\n💬 {conv_name}"
+                        resume_msg += f'\n💬 {conv_name}'
                     tg_send(cid, resume_msg)
-                    print("[sender] Resumed")
+                    print('[sender] Resumed')
                     continue
 
                 if text == '/screenshot':
-                    print(f"[sender] Taking screenshot of {active_instance_id and active_instance_id[:8]}...")
+                    print(
+                        f'[sender] Taking screenshot of {active_instance_id and active_instance_id[:8]}...'
+                    )
                     try:
                         cdp_bring_to_front(active_conn(), active_instance_id)
                     except Exception:
@@ -2182,41 +2449,50 @@ def sender_thread():
                     time.sleep(0.3)
                     png = cdp_screenshot()
                     if png:
-                        tg_send_photo_bytes(cid, png, caption="Cursor IDE screenshot")
-                        print(f"[sender] Screenshot sent ({len(png)} bytes)")
+                        tg_send_photo_bytes(cid, png, caption='Cursor IDE screenshot')
+                        print(f'[sender] Screenshot sent ({len(png)} bytes)')
                     else:
-                        tg_send(cid, "Failed to capture screenshot.")
+                        tg_send(cid, 'Failed to capture screenshot.')
                     continue
 
                 if text == '/newchat':
-                    print("[sender] Creating new chat...")
+                    print('[sender] Creating new chat...')
                     result = cursor_new_chat()
                     if not result or not result.startswith('OK'):
-                        tg_send(cid, f"Failed: {result}")
-                    print(f"[sender] New chat: {result}")
+                        tg_send(cid, f'Failed: {result}')
+                    print(f'[sender] New chat: {result}')
                     continue
 
                 if text in ('/chats', '/agents', '/agent'):
                     # Single Telegram message — previously we sent one per workspace key (N workspaces => N pings).
                     keyboard_rows = []
-                    inst_with = [(iid, inf) for iid, inf in instance_registry.items() if inf.get('convs')]
+                    inst_with = [
+                        (iid, inf) for iid, inf in instance_registry.items() if inf.get('convs')
+                    ]
                     multi = len(inst_with) > 1
                     for iid, info in inst_with:
                         convs = info['convs']
                         for pc_id, conv in convs.items():
-                            is_mirrored = mirrored_chat and mirrored_chat[0] == iid and mirrored_chat[1] == pc_id
+                            is_mirrored = (
+                                mirrored_chat
+                                and mirrored_chat[0] == iid
+                                and mirrored_chat[1] == pc_id
+                            )
                             star = '▶ ' if is_mirrored else ''
-                            name = (conv.get('name') if isinstance(conv, dict) else None) or '(unnamed)'
-                            label = f"{star}[{iid[:8]}] {name}" if multi else f"{star}{name}"
+                            name = (
+                                conv.get('name') if isinstance(conv, dict) else None
+                            ) or '(unnamed)'
+                            label = f'{star}[{iid[:8]}] {name}' if multi else f'{star}{name}'
                             if len(label) > 64:
                                 label = label[:61] + '…'
                             keyboard_rows.append(
-                                [{'text': label, 'callback_data': f"chat:{iid}:{pc_id}"}])
+                                [{'text': label, 'callback_data': f'chat:{iid}:{pc_id}'}]
+                            )
                     if keyboard_rows:
                         n = len(keyboard_rows)
-                        body = f"📂 {n} chat(s) — tap to mirror"
+                        body = f'📂 {n} chat(s) — tap to mirror'
                         if multi:
-                            body += "\n[iid] = Cursor window id when multiple instances are open."
+                            body += '\n[iid] = Cursor window id when multiple instances are open.'
                         tg_call(
                             'sendMessage',
                             chat_id=cid,
@@ -2224,7 +2500,7 @@ def sender_thread():
                             reply_markup={'inline_keyboard': keyboard_rows},
                         )
                     else:
-                        tg_send(cid, "No open chats right now.")
+                        tg_send(cid, 'No open chats right now.')
                     continue
 
                 # Record what we're sending (so monitor knows which turn is ours)
@@ -2235,17 +2511,18 @@ def sender_thread():
                 # Send to Cursor with [Phone] prefix + timestamp (day name helps resolve relative dates)
                 tg_typing(cid)
                 result = cursor_send_message(text)
-                print(f"[sender] -> Cursor: {result}")
+                print(f'[sender] -> Cursor: {result}')
 
                 if 'ERROR' in str(result):
-                    tg_send(cid, f"Failed: {result}")
+                    tg_send(cid, f'Failed: {result}')
 
         except Exception as e:
-            print(f"[sender] Error: {e}")
+            print(f'[sender] Error: {e}')
             time.sleep(2)
 
 
 # ── Thread 2: Cursor → Telegram (monitor) ────────────────────────────────────
+
 
 def short_id(sid):
     """Shorten section IDs for readable logs.
@@ -2266,21 +2543,73 @@ def _composer_prefix_from_pcid(pc_id):
     return ''
 
 
+def _forwarded_id_seed_from_sections(sections):
+    """IDs of sections to treat as already mirrored to Telegram.
+
+    Pending tool confirmations are omitted so they can still be delivered after
+    you switch away and back (otherwise every section id was seeded on switch
+    and confirmations were skipped forever).
+    """
+    return {
+        sec.get('id', '')
+        for sec in sections
+        if isinstance(sec, dict) and sec.get('id') and sec.get('type') != 'confirmation'
+    }
+
+
+def _reconcile_mirrored_chat_from_dom():
+    """If DOM active tab != mirrored_chat, sync (click/focus can miss very fast tab switches)."""
+    global mirrored_chat
+    mc = mirrored_chat
+    if not mc:
+        return False
+    iid, pc_id, name = mc
+    info = instance_registry.get(iid)
+    if not info:
+        return False
+    conn = info.get('ws')
+    if not conn:
+        return False
+    try:
+        rows = list_chats(lambda js, c=conn: cdp_eval_on(c, js))
+    except Exception as e:
+        print(f'[monitor] reconcile list_chats: {e}')
+        return False
+    active_rows = [r for r in rows if r.get('active')]
+    if not active_rows:
+        return False
+    active = next(
+        (r for r in active_rows if str(r.get('pc_id', '')).startswith('cid-')),
+        None,
+    )
+    if not active:
+        active = active_rows[0]
+    apc = active.get('pc_id')
+    if not apc or apc == pc_id:
+        return False
+    new_name = (active.get('name') or '').strip() or name
+    with _switch_lock:
+        mirrored_chat = (iid, apc, new_name)
+    _save_active_chat(info.get('workspace'), new_name, apc)
+    print(f'[monitor] Reconciled active chat from DOM: {new_name!r}')
+    return True
+
+
 def monitor_thread():
     global mirrored_chat
-    print("[monitor] Starting Cursor monitor...")
-    last_turn_id = None         # Track conversation turns (DOM message id)
-    last_conv = None            # Track active conversation name (for logging)
-    mc = mirrored_chat          # Snapshot of mirrored_chat at init
-    last_mc_pcid = mc[1] if mc else None   # Track by pc_id (stable across renames)
+    print('[monitor] Starting Cursor monitor...')
+    last_turn_id = None  # Track conversation turns (DOM message id)
+    last_conv = None  # Track active conversation name (for logging)
+    mc = mirrored_chat  # Snapshot of mirrored_chat at init
+    last_mc_pcid = mc[1] if mc else None  # Track by pc_id (stable across renames)
     last_iid = mc[0] if mc else active_instance_id
-    forwarded_ids = set()       # {section_id} — sole dedup/tracking mechanism
-    sent_this_turn = False      # Whether we've forwarded anything this turn
-    prev_by_id = {}             # {section_id: text} from previous tick (for stability)
-    section_stable = {}         # {section_id: consecutive_stable_ticks}
-    STABLE_THRESHOLD = 2        # Forward section after 2s of no change
+    forwarded_ids = set()  # {section_id} — sole dedup/tracking mechanism
+    sent_this_turn = False  # Whether we've forwarded anything this turn
+    prev_by_id = {}  # {section_id: text} from previous tick (for stability)
+    section_stable = {}  # {section_id: consecutive_stable_ticks}
+    STABLE_THRESHOLD = 2  # Forward section after 2s of no change
     initialized = False
-    marked_done = False         # Whether we've sent ✅ for this turn
+    marked_done = False  # Whether we've sent ✅ for this turn
 
     while True:
         try:
@@ -2291,6 +2620,7 @@ def monitor_thread():
             if not cid:
                 continue
 
+            _reconcile_mirrored_chat_from_dom()
             # Get the last turn's info (scoped to mirrored chat's composer-id)
             # Use mirrored_chat's instance connection — not active_conn()
             mc = mirrored_chat
@@ -2313,26 +2643,30 @@ def monitor_thread():
                 if not found_iid:
                     continue
 
-                ws_label = (instance_registry[found_iid].get('workspace') or found_iid[:8]).removesuffix(' (Workspace)')
-                print(f"[monitor] Composer {cp} moved to {ws_label}, skipping {len(turn['sections'])} existing")
+                ws_label = (
+                    instance_registry[found_iid].get('workspace') or found_iid[:8]
+                ).removesuffix(' (Workspace)')
+                print(
+                    f'[monitor] Composer {cp} moved to {ws_label}, skipping {len(turn["sections"])} existing'
+                )
                 mirrored_chat = (found_iid, mc[1], mc[2])
                 last_iid = found_iid
                 last_mc_pcid = mc[1]
                 last_turn_id = turn['turn_id']
                 last_conv = turn.get('conv', '')
-                forwarded_ids = {
-                    sec.get('id', '') for sec in turn['sections']
+                forwarded_ids = _forwarded_id_seed_from_sections(turn['sections'])
+                prev_by_id = {
+                    sec.get('id', ''): sec.get('text', '')
+                    for sec in turn['sections']
                     if isinstance(sec, dict) and sec.get('id')
                 }
-                prev_by_id = {sec.get('id', ''): sec.get('text', '')
-                              for sec in turn['sections'] if isinstance(sec, dict) and sec.get('id')}
                 section_stable = {}
                 sent_this_turn = False
                 marked_done = False
                 continue
 
-            turn_id = turn['turn_id']              # Unique DOM id per turn
-            user_full = turn['user_full']           # Full text for forwarding
+            turn_id = turn['turn_id']  # Unique DOM id per turn
+            user_full = turn['user_full']  # Full text for forwarding
             sections = turn['sections']
             images = turn.get('images', [])
             conv = turn.get('conv', '')
@@ -2352,11 +2686,20 @@ def monitor_thread():
             if switched:
                 if cur_iid != last_iid:
                     cp = _composer_prefix_from_pcid(cur_pcid) if cur_pcid else ''
-                    turn = cursor_get_turn_info(cp)
+                    sw_conn = instance_registry.get(cur_iid, {}).get('ws')
+                    turn = (
+                        cursor_get_turn_info(cp, conn=sw_conn)
+                        if sw_conn
+                        else cursor_get_turn_info(cp)
+                    )
                     if not turn['turn_id'] and not turn['sections']:
                         for _retry in range(8):
                             time.sleep(0.5)
-                            turn = cursor_get_turn_info(cp)
+                            turn = (
+                                cursor_get_turn_info(cp, conn=sw_conn)
+                                if sw_conn
+                                else cursor_get_turn_info(cp)
+                            )
                             if turn['turn_id'] or turn['sections']:
                                 break
                     turn_id = turn['turn_id']
@@ -2364,14 +2707,16 @@ def monitor_thread():
                     conv = turn.get('conv', '')
                 cur_name = mc[2] if mc else conv
                 prev_name = last_conv or f'instance {last_iid[:8] if last_iid else "?"}'
-                print(f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', skipping {len(sections)} sections")
-                forwarded_ids = {
-                    sec.get('id', '') for sec in sections
+                print(
+                    f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', skipping {len(sections)} sections"
+                )
+                forwarded_ids = _forwarded_id_seed_from_sections(sections)
+                sent_this_turn = False
+                prev_by_id = {
+                    sec.get('id', ''): sec.get('text', '')
+                    for sec in sections
                     if isinstance(sec, dict) and sec.get('id')
                 }
-                sent_this_turn = False
-                prev_by_id = {sec.get('id', ''): sec.get('text', '')
-                              for sec in sections if isinstance(sec, dict) and sec.get('id')}
                 section_stable = {}
                 marked_done = False
                 if CONTEXT_MONITOR and cur_pcid:
@@ -2401,27 +2746,32 @@ def monitor_thread():
                         if mc:
                             info = instance_registry.get(mc[0], {})
                             ws_label = (info.get('workspace') or '').removesuffix(' (Workspace)')
-                        print(f"[monitor] Active conv: {conv}" + (f'  ({ws_label})' if ws_label else ''))
-                    forwarded_ids = {
-                        sec.get('id', '') for sec in sections
-                        if isinstance(sec, dict) and sec.get('id')
-                    }
+                        print(
+                            f'[monitor] Active conv: {conv}'
+                            + (f'  ({ws_label})' if ws_label else '')
+                        )
+                    forwarded_ids = _forwarded_id_seed_from_sections(sections)
                     initialized = True
                     last_turn_id = turn_id
-                    prev_by_id = {sec.get('id', ''): sec.get('text', '')
-                                  for sec in sections if isinstance(sec, dict) and sec.get('id')}
+                    prev_by_id = {
+                        sec.get('id', ''): sec.get('text', '')
+                        for sec in sections
+                        if isinstance(sec, dict) and sec.get('id')
+                    }
                     section_stable = {}
                     continue
 
                 if not user_full:
-                    print(f"[monitor] user_full empty, polling (turn_id={short_id(turn_id)})...")
+                    print(f'[monitor] user_full empty, polling (turn_id={short_id(turn_id)})...')
                     for attempt in range(10):
                         time.sleep(0.2)
                         t = cursor_get_turn_info(cp)
                         t_tid = t['turn_id']
                         t_uf = t['user_full']
                         if t_tid != turn_id:
-                            print(f"[monitor]   poll {attempt}: turn_id changed -> {short_id(t_tid)}, abort")
+                            print(
+                                f'[monitor]   poll {attempt}: turn_id changed -> {short_id(t_tid)}, abort'
+                            )
                             break
                         if t_uf:
                             print(f"[monitor]   poll {attempt}: got '{t_uf[:40]}'")
@@ -2430,21 +2780,18 @@ def monitor_thread():
                             images = t.get('images') or images
                             break
                     else:
-                        print(f"[monitor]   poll exhausted, user_full still empty")
+                        print('[monitor]   poll exhausted, user_full still empty')
 
                 # Check if this came from Telegram or was typed directly in Cursor
                 with last_sent_lock:
                     sent = last_sent_text
-                from_telegram = (sent and (
-                    sent[:30] in user_full
-                    or sent == '[photo]'
-                ))
+                from_telegram = sent and (sent[:30] in user_full or sent == '[photo]')
 
-                origin = "Telegram" if from_telegram else "Cursor"
+                origin = 'Telegram' if from_telegram else 'Cursor'
                 print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
                 for idx, sec in enumerate(sections):
                     if isinstance(sec, dict):
-                        print(f"  [{idx}] {sec.get('type', '?'):12s}  id={short_id(sec.get('id'))}")
+                        print(f'  [{idx}] {sec.get("type", "?"):12s}  id={short_id(sec.get("id"))}')
 
                 if CONTEXT_MONITOR and mirrored_chat:
                     cur_pcid = mirrored_chat[1]
@@ -2461,27 +2808,27 @@ def monitor_thread():
                             name = _context_pct_names.get(pid, pid)
                             if pid == cur_pcid:
                                 delta = ctx - prev_pct if prev_pct is not None else 0
-                                trend = " 📈" if delta > 0 else " 📉" if delta < 0 else ""
-                                lines.append(f"  {name}: {pct:.1f}%{trend}")
+                                trend = ' 📈' if delta > 0 else ' 📉' if delta < 0 else ''
+                                lines.append(f'  {name}: {pct:.1f}%{trend}')
                             else:
-                                lines.append(f"  {name}: {pct:.1f}%")
+                                lines.append(f'  {name}: {pct:.1f}%')
                         print('\n'.join(lines))
                     if ann:
                         try:
                             cursor_prefill_input(ann, conn=mc_conn)
-                            print(f"[context-monitor] Prefilled: {ann}")
+                            print(f'[context-monitor] Prefilled: {ann}')
                         except Exception as e:
-                            print(f"[context-monitor] Failed to prefill: {e}")
+                            print(f'[context-monitor] Failed to prefill: {e}')
 
                 if not from_telegram:
                     if not muted and user_full:
-                        tg_send(cid, f"[PC] {user_full}")
+                        tg_send(cid, f'[PC] {user_full}')
 
                         for img_url in images:
                             local_path = vscode_url_to_path(img_url)
                             if local_path and Path(local_path).exists():
-                                print(f"[monitor] Forwarding image: {Path(local_path).name}")
-                                tg_send_photo(cid, local_path, caption="[PC] attached image")
+                                print(f'[monitor] Forwarding image: {Path(local_path).name}')
+                                tg_send_photo(cid, local_path, caption='[PC] attached image')
 
                 forwarded_ids = set()
                 sent_this_turn = False
@@ -2506,15 +2853,16 @@ def monitor_thread():
                 if isinstance(sec, dict) and sec.get('id'):
                     sid = sec['id']
                     if sid not in prev_by_id and sid not in forwarded_ids:
-                        print(f"[monitor] + New bubble [{i}] {sec.get('type', '?'):12s}  id={short_id(sid)}")
+                        print(
+                            f'[monitor] + New bubble [{i}] {sec.get("type", "?"):12s}  id={short_id(sid)}'
+                        )
 
             # [SILENT] scan: if ANY section contains [SILENT], suppress entire response
             turn_silent = any(
-                '[SILENT]' in (s['text'] if isinstance(s, dict) else s)
-                for s in sections
+                '[SILENT]' in (s['text'] if isinstance(s, dict) else s) for s in sections
             )
             if turn_silent and not getattr(monitor_thread, '_silent_logged', False):
-                print(f"[monitor] [SILENT] detected — suppressing entire response")
+                print('[monitor] [SILENT] detected — suppressing entire response')
                 for s in sections:
                     sk = s.get('id', '') if isinstance(s, dict) else ''
                     if sk:
@@ -2557,8 +2905,9 @@ def monitor_thread():
                 if sec_type == 'confirmation':
                     # Always track confirmation selectors; send keyboard only when not muted
                     tool_id = sec_id
+                    cb_key = _confirm_callback_key(str(tool_id))
                     with pending_confirms_lock:
-                        if tool_id in pending_confirms:
+                        if cb_key in pending_confirms:
                             # Already tracked this confirmation
                             if sec_key:
                                 forwarded_ids.add(sec_key)
@@ -2567,9 +2916,10 @@ def monitor_thread():
                     buttons = sec.get('buttons', [])
                     btns_selector = sec.get('buttons_selector', '')
                     with pending_confirms_lock:
-                        pending_confirms[tool_id] = {
+                        pending_confirms[cb_key] = {
                             'buttons_selector': btns_selector,
-                            'buttons': buttons
+                            'buttons': buttons,
+                            'instance_id': mc[0] if mc else None,
                         }
 
                     # Auto-accept: check command text against allow/deny rules
@@ -2579,30 +2929,41 @@ def monitor_thread():
                         if accept_idx is not None:
                             # Screenshot BEFORE click (click changes DOM)
                             png = cdp_screenshot_element(sec_selector) if sec_selector else None
-                            click_result = cdp_eval(f"""
+                            _accept_js = f"""
                                 (function() {{
                                     const btns = document.querySelectorAll('{btns_selector}');
                                     if (!btns[{accept_idx}]) return 'ERROR: button not found';
                                     btns[{accept_idx}].click();
                                     return 'OK';
                                 }})();
-                            """)
-                            if click_result and click_result.strip() == 'OK':
-                                print(f"[command-rules] Auto-accepted: {text} -> {accept_label}")
+                            """
+                            click_result = (
+                                cdp_eval_on(mc_conn, _accept_js)
+                                if mc_conn
+                                else cdp_eval(_accept_js)
+                            )
+                            if click_result and str(click_result).strip() == 'OK':
+                                print(f'[command-rules] Auto-accepted: {text} -> {accept_label}')
                                 if not muted and cid:
                                     if png:
-                                        tg_send_photo_bytes(cid, png, filename='auto_accept.png',
-                                                            caption=f"✅ Auto: {text}")
+                                        tg_send_photo_bytes(
+                                            cid,
+                                            png,
+                                            filename='auto_accept.png',
+                                            caption=f'✅ Auto: {text}',
+                                        )
                                     else:
-                                        tg_send(cid, f"✅ Auto: {text}")
+                                        tg_send(cid, f'✅ Auto: {text}')
                                 with pending_confirms_lock:
-                                    pending_confirms.pop(tool_id, None)
+                                    pending_confirms.pop(cb_key, None)
                                 if sec_key:
                                     forwarded_ids.add(sec_key)
                                 section_stable.pop(sec_key, None)
                                 continue
                             else:
-                                print(f"[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard")
+                                print(
+                                    f'[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard'
+                                )
 
                     if not muted:
                         tg_typing(cid)
@@ -2611,18 +2972,36 @@ def monitor_thread():
                             png = cdp_screenshot_element(sec_selector)
                         keyboard = []
                         for btn in buttons:
-                            keyboard.append([{
-                                'text': btn['label'],
-                                'callback_data': f"btn_{btn['index']}:{tool_id}"
-                            }])
+                            cb_line = f'btn_{btn["index"]}:{cb_key}'
+                            if len(cb_line.encode('utf-8')) > 64:
+                                print(
+                                    f'[monitor] ERROR: callback_data too long for Telegram ({len(cb_line)}): {cb_line!r}'
+                                )
+                            keyboard.append(
+                                [
+                                    {
+                                        'text': btn['label'],
+                                        'callback_data': cb_line,
+                                    }
+                                ]
+                            )
                         if png:
-                            print(f"[monitor] Forwarding CONFIRMATION with keyboard: {text}")
-                            tg_send_photo_bytes_with_keyboard(cid, png, keyboard,
-                                filename='confirmation.png', caption=f"⚡ {text}")
+                            print(f'[monitor] Forwarding CONFIRMATION with keyboard: {text}')
+                            tg_send_photo_bytes_with_keyboard(
+                                cid,
+                                png,
+                                keyboard,
+                                filename='confirmation.png',
+                                caption=f'⚡ {text}',
+                            )
                         else:
-                            print(f"[monitor] Forwarding CONFIRMATION as text: {text}")
-                            tg_call('sendMessage', chat_id=cid, text=f"⚡ {text}",
-                                    reply_markup={'inline_keyboard': keyboard})
+                            print(f'[monitor] Forwarding CONFIRMATION as text: {text}')
+                            tg_call(
+                                'sendMessage',
+                                chat_id=cid,
+                                text=f'⚡ {text}',
+                                reply_markup={'inline_keyboard': keyboard},
+                            )
 
                 elif not muted:
                     # Only send to Telegram when not muted
@@ -2634,7 +3013,7 @@ def monitor_thread():
                             if fn_sel:
                                 file_path = cdp_hover_file_path(fn_sel)
                                 if file_path:
-                                    print(f"[monitor] File path: {file_path}")
+                                    print(f'[monitor] File path: {file_path}')
                         png = None
                         expanded = False
                         if sec_selector:
@@ -2646,25 +3025,36 @@ def monitor_thread():
                             png = cdp_screenshot_element(
                                 '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
                             )
-                        label = {'table': 'TABLE', 'file_edit': 'FILE_EDIT', 'code_block': 'CODE_BLOCK', 'latex': 'LATEX'}[sec_type]
+                        label = {
+                            'table': 'TABLE',
+                            'file_edit': 'FILE_EDIT',
+                            'code_block': 'CODE_BLOCK',
+                            'latex': 'LATEX',
+                        }[sec_type]
                         if sec_type == 'file_edit':
                             stat = sec.get('file_stat', '') if isinstance(sec, dict) else ''
                             display = file_path or text
                             if file_path and stat:
-                                display = f"{file_path} {stat}"
-                            caption = f"📝 {display}"
+                                display = f'{file_path} {stat}'
+                            caption = f'📝 {display}'
                         else:
                             caption = ''
                         if png:
-                            print(f"[monitor] Forwarding section {i+1} as {label} screenshot ({len(png)} bytes)")
-                            tg_send_photo_bytes(cid, png, filename=f'{sec_type}.png', caption=caption)
+                            print(
+                                f'[monitor] Forwarding section {i + 1} as {label} screenshot ({len(png)} bytes)'
+                            )
+                            tg_send_photo_bytes(
+                                cid, png, filename=f'{sec_type}.png', caption=caption
+                            )
                         else:
-                            print(f"[monitor] {label} screenshot failed, sending as text ({len(text)} chars)")
+                            print(
+                                f'[monitor] {label} screenshot failed, sending as text ({len(text)} chars)'
+                            )
                             prefix = '📝 ' if sec_type == 'file_edit' else ''
                             display_text = (file_path or text) if sec_type == 'file_edit' else text
-                            tg_send(cid, f"{prefix}{display_text}")
+                            tg_send(cid, f'{prefix}{display_text}')
                     elif sec_type == 'thinking':
-                        print(f"[monitor] Forwarding THINKING ({len(text)} chars)")
+                        print(f'[monitor] Forwarding THINKING ({len(text)} chars)')
                         tg_send_thinking(cid, text)
                     else:
                         # Check for [PHONE_OUTBOX:filename] marker
@@ -2674,25 +3064,29 @@ def monitor_thread():
                             caption = OUTBOX_MARKER_RE.sub('', text).strip()
                             # Wait up to 15s for the file to appear
                             outbox_file = phone_outbox / outbox_filename
-                            print(f"[monitor] Outbox marker: waiting for {outbox_filename}")
+                            print(f'[monitor] Outbox marker: waiting for {outbox_filename}')
                             deadline = time.time() + 15
                             while not outbox_file.exists() and time.time() < deadline:
                                 time.sleep(1)
                             if outbox_file.exists():
                                 outbox_render_and_send(outbox_filename, cid, caption=caption)
                             else:
-                                print(f"[monitor] Outbox file not found after 15s: {outbox_filename}")
+                                print(
+                                    f'[monitor] Outbox file not found after 15s: {outbox_filename}'
+                                )
                                 if caption:
                                     tg_send(cid, caption)
                         else:
-                            print(f"[monitor] Forwarding section {i+1} ({len(text)} chars)")
+                            print(f'[monitor] Forwarding section {i + 1} ({len(text)} chars)')
                             tg_send(cid, text)
 
                 # Always advance tracking — muted sections are "silently consumed"
                 if sec_key:
                     forwarded_ids.add(sec_key)
                 sent_this_turn = True
-                print(f"[monitor]   → [{i}] {sec_type:12s}  id={short_id(sec_key)}  ids={len(forwarded_ids)}")
+                print(
+                    f'[monitor]   → [{i}] {sec_type:12s}  id={short_id(sec_key)}  ids={len(forwarded_ids)}'
+                )
                 section_stable.pop(sec_key, None)
 
             # Build prev_by_id for next tick's stability comparison
@@ -2707,11 +3101,11 @@ def monitor_thread():
                     (function() { return !!document.querySelector('[data-stop-button="true"]'); })();
                 """)
                 if not is_gen:
-                    print(f"[monitor] AI done — {len(forwarded_ids)} sections forwarded")
+                    print(f'[monitor] AI done — {len(forwarded_ids)} sections forwarded')
                     marked_done = True
 
         except Exception as e:
-            print(f"[monitor] Error: {e}")
+            print(f'[monitor] Error: {e}')
             time.sleep(2)
 
 
@@ -2724,14 +3118,15 @@ def monitor_thread():
 # This thread handles instance lifecycle (new/closed/workspace changes)
 # and periodic conversation scans (new/closed/renamed chats).
 
-SCAN_INTERVAL = 3     # seconds between full rescans
+SCAN_INTERVAL = 3  # seconds between full rescans
 SCAN_VERBOSE = False  # True = log every chat per scan (fingerprint details)
 CONTEXT_MONITOR_THRESHOLD = 85
+
 
 def overview_thread():
     """Periodically rescan CDP targets. Detect new/closed Cursor instances."""
     global ws, active_instance_id, mirrored_chat
-    print("[overview] Starting instance monitor...")
+    print('[overview] Starting instance monitor...')
     if not mirrored_chat and active_instance_id and active_instance_id in instance_registry:
         info = instance_registry[active_instance_id]
         for pc_id, conv in info.get('convs', {}).items():
@@ -2752,16 +3147,18 @@ def overview_thread():
                 h, m = uptime_s // 3600, (uptime_s % 3600) // 60
                 n_inst = len(instance_registry)
                 n_chats = sum(len(info.get('convs', {})) for info in instance_registry.values())
-                print(f"[overview] heartbeat: {n_inst} instances, {n_chats} chats, uptime {h}h{m:02d}m")
+                print(
+                    f'[overview] heartbeat: {n_inst} instances, {n_chats} chats, uptime {h}h{m:02d}m'
+                )
 
             port = detect_cdp_port(exit_on_fail=False)
             if port is None:
                 _cdp_miss_count += 1
                 if _cdp_miss_count == 1:
-                    print("[overview] CDP port unavailable, will keep retrying...")
+                    print('[overview] CDP port unavailable, will keep retrying...')
                 continue
             if _cdp_miss_count > 0:
-                print(f"[overview] CDP port recovered after {_cdp_miss_count} missed cycles")
+                print(f'[overview] CDP port recovered after {_cdp_miss_count} missed cycles')
                 _cdp_miss_count = 0
             current = cdp_list_instances(port)
             current_ids = {inst['id'] for inst in current}
@@ -2771,7 +3168,8 @@ def overview_thread():
                 if inst['id'] not in known_ids:
                     label = inst['workspace'] or '(no workspace)'
                     is_detach = inst['workspace'] and any(
-                        info['workspace'] == inst['workspace'] for info in instance_registry.values()
+                        info['workspace'] == inst['workspace']
+                        for info in instance_registry.values()
                     )
                     try:
                         conn = websocket.create_connection(inst['ws_url'])
@@ -2786,23 +3184,23 @@ def overview_thread():
                                 'convs': {},
                             }
                         if is_detach:
-                            print(f"[overview] Detached window: {label}  [{inst['id'][:8]}]")
+                            print(f'[overview] Detached window: {label}  [{inst["id"][:8]}]')
                         else:
-                            print(f"[overview] Opened: {label}  [{inst['id'][:8]}]")
+                            print(f'[overview] Opened: {label}  [{inst["id"][:8]}]')
                             if chat_id and not muted and inst['workspace']:
-                                tg_send(chat_id, f"📂 Workspace opened: {label}")
+                                tg_send(chat_id, f'📂 Workspace opened: {label}')
                     except Exception as e:
-                        print(f"[overview] Failed to connect to {label}: {e}")
+                        print(f'[overview] Failed to connect to {label}: {e}')
 
             for iid in known_ids - current_ids:
                 with cdp_lock:
                     info = instance_registry.pop(iid, None)
                     if info:
-                        is_active = (iid == active_instance_id)
+                        is_active = iid == active_instance_id
                         if is_active and instance_registry:
                             new_id = next(
                                 (k for k, v in instance_registry.items() if v['workspace']),
-                                next(iter(instance_registry))
+                                next(iter(instance_registry)),
                             )
                             active_instance_id = new_id
                             ws = instance_registry[new_id]['ws']
@@ -2823,16 +3221,18 @@ def overview_thread():
                         v['workspace'] == info['workspace'] for v in instance_registry.values()
                     )
                     if is_merge:
-                        print(f"[overview] Window merged: {label}  [{iid[:8]}]")
+                        print(f'[overview] Window merged: {label}  [{iid[:8]}]')
                     else:
-                        print(f"[overview] Closed: {label}  [{iid[:8]}]")
+                        print(f'[overview] Closed: {label}  [{iid[:8]}]')
                         if chat_id and not muted:
-                            tg_send(chat_id, f"📂 Workspace closed: {label}")
+                            tg_send(chat_id, f'📂 Workspace closed: {label}')
                     if is_active and active_instance_id:
-                        new_name = instance_registry[active_instance_id]['workspace'] or '(no workspace)'
-                        print(f"[overview] Active switched to: {new_name}")
+                        new_name = (
+                            instance_registry[active_instance_id]['workspace'] or '(no workspace)'
+                        )
+                        print(f'[overview] Active switched to: {new_name}')
                         if chat_id and not muted and not is_merge:
-                            tg_send(chat_id, f"📂 Workspace activated: {new_name}")
+                            tg_send(chat_id, f'📂 Workspace activated: {new_name}')
 
             # Detect workspace changes (e.g. user picked a workspace in empty instance)
             for inst in current:
@@ -2842,9 +3242,11 @@ def overview_thread():
                         with cdp_lock:
                             old['workspace'] = inst['workspace']
                             old['title'] = inst['title']
-                        print(f"[overview] Workspace opened: {inst['workspace']}  [{inst['id'][:8]}]")
+                        print(
+                            f'[overview] Workspace opened: {inst["workspace"]}  [{inst["id"][:8]}]'
+                        )
                         if chat_id and not muted:
-                            tg_send(chat_id, f"📂 Workspace opened: {inst['workspace']}")
+                            tg_send(chat_id, f'📂 Workspace opened: {inst["workspace"]}')
 
             # Reconnect dead listeners
             for iid, info in list(instance_registry.items()):
@@ -2860,9 +3262,9 @@ def overview_thread():
                         listener_conn = _setup_chat_listener(iid, info['ws_url'], label)
                         info['listener_ws'] = listener_conn
                         info.pop('listener_dead', None)
-                        print(f"[overview] Listener reconnected: {label}")
+                        print(f'[overview] Listener reconnected: {label}')
                     except Exception as e:
-                        print(f"[overview] Listener reconnect failed for {label}: {e}")
+                        print(f'[overview] Listener reconnect failed for {label}: {e}')
 
             # Scan conversations per instance. Each CDP target gets its own scan
             # because detached windows have distinct DOMs despite sharing a workspace name.
@@ -2884,7 +3286,9 @@ def overview_thread():
                     for c in convs:
                         mid = c.get('msg_id', '-')
                         mid_short = mid[:12] if mid and mid != '-' else '-'
-                        print(f"[overview] fingerprint: {c['pc_id']}  msg={mid_short:14s}  \"{c['name']}\"  in {ws_label}")
+                        print(
+                            f'[overview] fingerprint: {c["pc_id"]}  msg={mid_short:14s}  "{c["name"]}"  in {ws_label}'
+                        )
 
                 # Fingerprint-scoring: match disappeared↔appeared entries
                 disappeared = set(known_convs) - set(current_convs)
@@ -2893,7 +3297,9 @@ def overview_thread():
                 if disappeared or appeared:
                     d_names = {pid: known_convs[pid]['name'] for pid in disappeared}
                     a_names = {pid: current_convs[pid]['name'] for pid in appeared}
-                    print(f"[overview] diff: disappeared={d_names}  appeared={a_names}  in {ws_label}")
+                    print(
+                        f'[overview] diff: disappeared={d_names}  appeared={a_names}  in {ws_label}'
+                    )
 
                 if disappeared and appeared:
                     scores = {}  # (appeared_id, disappeared_id) → score
@@ -2912,9 +3318,9 @@ def overview_thread():
                                 scores[(a_id, d_id)] = score
 
                     if scores:
-                        print(f"[overview] scores: {scores}  in {ws_label}")
+                        print(f'[overview] scores: {scores}  in {ws_label}')
                     else:
-                        print(f"[overview] scores: EMPTY (no matches found)  in {ws_label}")
+                        print(f'[overview] scores: EMPTY (no matches found)  in {ws_label}')
 
                     matched_a = set()
                     matched_d = set()
@@ -2922,12 +3328,24 @@ def overview_thread():
                         if a_id in matched_a or d_id in matched_d:
                             continue
                         # Check for ambiguity: is there another pair with the same score for this d_id?
-                        rivals = [s for (ai, di), s in scores.items() if di == d_id and ai != a_id and s == score]
+                        rivals = [
+                            s
+                            for (ai, di), s in scores.items()
+                            if di == d_id and ai != a_id and s == score
+                        ]
                         if rivals:
-                            print(f"[overview] Ambiguous match for \"{known_convs[d_id]['name']}\" (score={score}, {len(rivals)+1} candidates) — skipping  in {ws_label}")
+                            print(
+                                f'[overview] Ambiguous match for "{known_convs[d_id]["name"]}" (score={score}, {len(rivals) + 1} candidates) — skipping  in {ws_label}'
+                            )
                             continue
-                        mid_info = f"msg={current_convs[a_id].get('msg_id', '-')[:12]}" if current_convs[a_id].get('msg_id') else "msg=-"
-                        print(f"[overview] Linked: {d_id} -> {a_id}  score={score}  {mid_info}  \"{known_convs[d_id]['name']}\"  in {ws_label}")
+                        mid_info = (
+                            f'msg={current_convs[a_id].get("msg_id", "-")[:12]}'
+                            if current_convs[a_id].get('msg_id')
+                            else 'msg=-'
+                        )
+                        print(
+                            f'[overview] Linked: {d_id} -> {a_id}  score={score}  {mid_info}  "{known_convs[d_id]["name"]}"  in {ws_label}'
+                        )
                         known_convs[a_id] = known_convs.pop(d_id)
                         matched_a.add(a_id)
                         matched_d.add(d_id)
@@ -2936,35 +3354,44 @@ def overview_thread():
                     appeared -= matched_a
 
                 for pc_id in appeared:
-                    print(f"[overview] New conversation: {current_convs[pc_id]['name']}  in {ws_label}")
+                    print(
+                        f'[overview] New conversation: {current_convs[pc_id]["name"]}  in {ws_label}'
+                    )
 
                 for pc_id in disappeared:
-                    print(f"[overview] Conversation closed: {known_convs[pc_id]['name']}  in {ws_label}")
+                    print(
+                        f'[overview] Conversation closed: {known_convs[pc_id]["name"]}  in {ws_label}'
+                    )
 
                 for pc_id, conv in current_convs.items():
                     if pc_id in known_convs and known_convs[pc_id]['name'] != conv['name']:
                         old_name = known_convs[pc_id]['name']
-                        print(f"[overview] Conversation renamed: {old_name} → {conv['name']}  in {ws_label}")
+                        print(
+                            f'[overview] Conversation renamed: {old_name} → {conv["name"]}  in {ws_label}'
+                        )
                         rename_digest.append((old_name, conv['name'], ws_label))
 
-                info['convs'] = {pc_id: {'name': c['name'], 'active': c['active'], 'msg_id': c.get('msg_id')} for pc_id, c in current_convs.items()}
+                info['convs'] = {
+                    pc_id: {'name': c['name'], 'active': c['active'], 'msg_id': c.get('msg_id')}
+                    for pc_id, c in current_convs.items()
+                }
                 scan_summary[ws_label] = scan_summary.get(ws_label, 0) + len(convs)
 
             if rename_digest and chat_id and not muted:
-                lines = [f"• {o} → {n}  ({w})" for o, n, w in rename_digest[:35]]
+                lines = [f'• {o} → {n}  ({w})' for o, n, w in rename_digest[:35]]
                 if len(rename_digest) > 35:
-                    lines.append(f"… +{len(rename_digest) - 35} more")
-                tg_send(chat_id, "💬 Renamed this scan:\n" + "\n".join(lines))
+                    lines.append(f'… +{len(rename_digest) - 35} more')
+                tg_send(chat_id, '💬 Renamed this scan:\n' + '\n'.join(lines))
 
             if scan_summary:
-                parts = '  '.join(f"{ws} ({n})" for ws, n in scan_summary.items())
-                print(f"[overview] chat scan: {parts}")
+                parts = '  '.join(f'{ws} ({n})' for ws, n in scan_summary.items())
+                print(f'[overview] chat scan: {parts}')
 
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                print(f"[overview] Caught {type(e).__name__} — overview thread staying alive")
+                print(f'[overview] Caught {type(e).__name__} — overview thread staying alive')
             else:
-                print(f"[overview] Error: {e}")
+                print(f'[overview] Error: {e}')
             time.sleep(5)
 
 
@@ -2974,9 +3401,11 @@ _render_local = os.environ.get('RENDER_LOCAL_DIR', '').strip()
 if _render_local:
     MD_TO_IMAGE_SCRIPT = Path(_render_local) / 'md_to_image.mjs'
     if MD_TO_IMAGE_SCRIPT.exists():
-        print(f"[outbox] Using local render: {MD_TO_IMAGE_SCRIPT}")
+        print(f'[outbox] Using local render: {MD_TO_IMAGE_SCRIPT}')
     else:
-        print(f"[outbox] WARNING: RENDER_LOCAL_DIR set but {MD_TO_IMAGE_SCRIPT} not found. Run setup_local_render.py")
+        print(
+            f'[outbox] WARNING: RENDER_LOCAL_DIR set but {MD_TO_IMAGE_SCRIPT} not found. Run setup_local_render.py'
+        )
         MD_TO_IMAGE_SCRIPT = Path(__file__).parent / 'md_to_image.mjs'
 else:
     MD_TO_IMAGE_SCRIPT = Path(__file__).parent / 'md_to_image.mjs'
@@ -2986,7 +3415,7 @@ phone_outbox.mkdir(exist_ok=True)
 
 def outbox_render_and_send(filename, cid, caption=None):
     """Render an outbox file and send it to Telegram. Returns True on success.
-    
+
     Width convention: 'name.w800.md' → render at 800px. Default 450px.
     """
     f = phone_outbox / filename
@@ -3005,15 +3434,18 @@ def outbox_render_and_send(filename, cid, caption=None):
         try:
             result = sp.run(
                 ['node', str(MD_TO_IMAGE_SCRIPT), str(f), '--out', str(png_path)] + width_args,
-                capture_output=True, text=True, encoding='utf-8',
-                errors='replace', timeout=60
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=60,
             )
             if result.returncode != 0:
-                print(f"[outbox] Render failed: {result.stderr.strip()}")
+                print(f'[outbox] Render failed: {result.stderr.strip()}')
                 return False
             png_bytes = png_path.read_bytes()
         except Exception as e:
-            print(f"[outbox] Render error: {e}")
+            print(f'[outbox] Render error: {e}')
             return False
         finally:
             try:
@@ -3027,19 +3459,24 @@ def outbox_render_and_send(filename, cid, caption=None):
             png_bytes = f.read_bytes()
             f.unlink()
         except Exception as e:
-            print(f"[outbox] Read error: {e}")
+            print(f'[outbox] Read error: {e}')
             return False
 
     if png_bytes:
         tg_send_photo_bytes(cid, png_bytes, filename=f'{f.stem}.png', caption=caption)
-        print(f"[outbox] Sent {filename} ({len(png_bytes)} bytes)" + (f" with caption ({len(caption)} chars)" if caption else ""))
+        print(
+            f'[outbox] Sent {filename} ({len(png_bytes)} bytes)'
+            + (f' with caption ({len(caption)} chars)' if caption else '')
+        )
         return True
     return False
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 # Single-instance guard: prevent multiple bridge processes
 _lock_file = Path(__file__).parent / '.bridge.lock'
+
 
 def _is_process_alive(pid):
     """Check if another bridge process is still running (single-instance guard)."""
@@ -3050,12 +3487,15 @@ def _is_process_alive(pid):
             return False
         return True
     import ctypes
+
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.OpenProcess(0x0400 | 0x1000, False, pid)
     if not handle:
         # Cannot query — assume alive so we never start a second bridge by mistake
         # (duplicate bridges = every Telegram message repeated N times).
-        print(f"[bridge] Could not query PID {pid}; if no bridge is running, delete {_lock_file} and retry.")
+        print(
+            f'[bridge] Could not query PID {pid}; if no bridge is running, delete {_lock_file} and retry.'
+        )
         return True
     try:
         exit_code = ctypes.c_ulong()
@@ -3064,14 +3504,15 @@ def _is_process_alive(pid):
     finally:
         kernel32.CloseHandle(handle)
 
+
 def _check_single_instance():
     """Ensure only one bridge process is running. Uses a PID lock file."""
     if _lock_file.exists():
         try:
             old_pid = int(_lock_file.read_text().strip())
             if _is_process_alive(old_pid):
-                print(f"ERROR: Bridge is already running (PID {old_pid}).")
-                print(f"Kill it first: taskkill /PID {old_pid} /F")
+                print(f'ERROR: Bridge is already running (PID {old_pid}).')
+                print(f'Kill it first: taskkill /PID {old_pid} /F')
                 sys.exit(1)
             # Process is dead, stale lock file — proceed
         except (ValueError, OSError):
@@ -3079,57 +3520,61 @@ def _check_single_instance():
     # Write our PID
     _lock_file.write_text(str(os.getpid()))
 
+
 def _cleanup_lock():
     try:
         if _lock_file.exists() and _lock_file.read_text().strip() == str(os.getpid()):
             _lock_file.unlink()
     except OSError:
         pass
+
+
 atexit.register(_cleanup_lock)
 
 _check_single_instance()
 
-print("Checking bot identity...")
+print('Checking bot identity...')
 me = tg_call('getMe')
 if not me.get('ok'):
-    print("ERROR: Cannot reach Telegram API")
+    print('ERROR: Cannot reach Telegram API')
     sys.exit(1)
 bot = me['result']
-print(f"Bot: @{bot['username']} ({bot['first_name']})")
+print(f'Bot: @{bot["username"]} ({bot["first_name"]})')
 
 # Set bot description if not already configured (shown to new users above the START button)
 _desc = tg_call('getMyDescription')
 if not _desc.get('result', {}).get('description'):
-    tg_call('setMyDescription',
-            description="Your Cursor IDE, in your pocket.\n\nTap START to pair. Your conversations then flow both ways between Cursor and Telegram.")
+    tg_call(
+        'setMyDescription',
+        description='Your Cursor IDE, in your pocket.\n\nTap START to pair. Your conversations then flow both ways between Cursor and Telegram.',
+    )
 _short = tg_call('getMyShortDescription')
 if not _short.get('result', {}).get('short_description'):
-    tg_call('setMyShortDescription',
-            short_description="Cursor IDE ↔ Telegram bridge")
+    tg_call('setMyShortDescription', short_description='Cursor IDE ↔ Telegram bridge')
 
-print("Connecting to Cursor via CDP...")
+print('Connecting to Cursor via CDP...')
 cdp_connect()
-print("Connected.")
+print('Connected.')
 
-print(f"\nPocketCursor Bridge v2 running!")
-print(f"Send a message to @{bot['username']} on Telegram.")
+print('\nPocketCursor Bridge v2 running!')
+print(f'Send a message to @{bot["username"]} on Telegram.')
 print(
-    "[bridge] If every message appears 2–5×, stop duplicate python.exe processes "
-    "(run restart_pocket_cursor.py or Task Manager → end tasks running pocket_cursor.py)."
+    '[bridge] If every message appears 2–5×, stop duplicate python.exe processes '
+    '(run restart_pocket_cursor.py or Task Manager → end tasks running pocket_cursor.py).'
 )
 if OWNER_ID:
-    print(f"Owner: {OWNER_ID}")
+    print(f'Owner: {OWNER_ID}')
 if chat_id:
-    print(f"Chat ID: {chat_id} (restored from previous session)")
+    print(f'Chat ID: {chat_id} (restored from previous session)')
 if muted:
-    print("Status: PAUSED (restored from previous session)")
+    print('Status: PAUSED (restored from previous session)')
 
 # Check if bot commands need updating and ask the user
 if chat_id and tg_commands_need_update():
-    print("[telegram] Command menu is outdated, asking user to update...")
+    print('[telegram] Command menu is outdated, asking user to update...')
     tg_ask_command_update(chat_id)
 
-print("Press Ctrl+C to stop.\n")
+print('Press Ctrl+C to stop.\n')
 
 t1 = threading.Thread(target=sender_thread, daemon=True)
 t2 = threading.Thread(target=monitor_thread, daemon=True)
@@ -3142,10 +3587,10 @@ try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
-    print("\nStopping...")
+    print('\nStopping...')
     for info in instance_registry.values():
         try:
             info['ws'].close()
         except Exception:
             pass
-    print("Done.")
+    print('Done.')

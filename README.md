@@ -23,15 +23,15 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 
 ### Commands
 
-| Command | Description |
-|---------|-------------|
-| `/newchat` | Start a fresh conversation |
-| `/chats` | Show your open chats across all workspaces (tap to switch) |
-| `/pause` | Mute forwarding |
-| `/play` | Resume forwarding |
-| `/screenshot` | Screenshot your Cursor window |
-| `/unpair` | Disconnect this device |
-| `/start` | Show status and commands |
+| Command       | Description                                                |
+| ------------- | ---------------------------------------------------------- |
+| `/newchat`    | Start a fresh conversation                                 |
+| `/chats`      | Show your open chats across all workspaces (tap to switch) |
+| `/pause`      | Mute forwarding                                            |
+| `/play`       | Resume forwarding                                          |
+| `/screenshot` | Screenshot your Cursor window                              |
+| `/unpair`     | Disconnect this device                                     |
+| `/start`      | Show status and commands                                   |
 
 ### Under the hood
 
@@ -42,6 +42,7 @@ Also included: AI thinking sections (💭 prefix), chat notifications (new/close
 PocketCursor uses the Chrome DevTools Protocol (CDP) to talk to Cursor. Cursor is an Electron app (Chromium under the hood), so launching it with a debug port gives full DOM access via WebSocket.
 
 A Python script with three main threads does the rest:
+
 - **Sender thread** polls Telegram for messages, injects them into Cursor's Lexical editor via CDP
 - **Monitor thread** watches Cursor's DOM for new AI responses, streams them to Telegram
 - **Overview thread** tracks Cursor instances and conversations (open, close, rename)
@@ -116,18 +117,14 @@ python restart_pocket_cursor.py
 
 When Cursor asks for confirmation before running a command, the buttons appear on Telegram for you to tap. That works well for important decisions, but gets tedious for harmless things like `ls`, `git status`, or `cd`. Command rules let you define which commands auto-run and which always require your approval.
 
-Cursor has a built-in allowlist, but it works at executable level: allowing `Shell(python)` means trusting *every* Python script. Command rules match the full command text, so you can allow `python *restart_pocket_cursor.py*` without blindly trusting all of Python. Deny patterns scan the entire command string, including chained commands, so `ls && rm -rf /` is blocked even though `ls` alone would pass.
+Cursor has a built-in allowlist, but it works at executable level: allowing `Shell(python)` means trusting _every_ Python script. Command rules match the full command text, so you can allow `python *restart_pocket_cursor.py*` without blindly trusting all of Python. Deny patterns scan the entire command string, including chained commands, so `ls && rm -rf /` is blocked even though `ls` alone would pass.
 
 Every auto-accepted command still sends a screenshot notification to Telegram, so you stay informed even when away from your desk.
 
 ```json
 {
-  "allow": [
-    { "group": "Shell (safe)", "patterns": ["ls *", "cd *", "git status*", "git diff*"] }
-  ],
-  "deny": [
-    { "group": "Destructive", "patterns": ["rm ", "--force", "--hard"] }
-  ]
+  "allow": [{ "group": "Shell (safe)", "patterns": ["ls *", "cd *", "git status*", "git diff*"] }],
+  "deny": [{ "group": "Destructive", "patterns": ["rm ", "--force", "--hard"] }]
 }
 ```
 
@@ -175,6 +172,23 @@ python setup_local_render.py /path/to/local/render
 ```
 
 Then add `RENDER_LOCAL_DIR=/path/to/local/render` to your `.env`. When the network is fast again, remove the line — no code changes needed.
+
+## Observability (optional)
+
+For production or long-running setups you may want **metrics** (Prometheus-compatible counters via `prometheus-client`), optional **error reporting** with Sentry (`SENTRY_DSN` in `.env`), and **tracing** via OpenTelemetry (`lib/observability.py` on the Python side and `instrumentation.mjs` for Node tooling). The bridge logs to stdout by default; wire your platform’s agents as needed.
+
+## Development
+
+Validate changes (lint, format check, types, tests with coverage):
+
+```bash
+make setup
+# or: pip install -r requirements.txt -r requirements-dev.txt && npm install && (cd tests && npm ci)
+npm run validate
+# or: make validate
+```
+
+Puppeteer installs Chromium on first `npm install` and needs network access. Optional [pre-commit](https://pre-commit.com/) hooks: `pip install pre-commit && pre-commit install`. Agent-oriented notes live in `AGENTS.md`.
 
 ## Requirements
 
