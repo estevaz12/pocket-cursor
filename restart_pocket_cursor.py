@@ -16,6 +16,7 @@ Usage:
 import subprocess
 import sys
 import os
+import time
 import functools
 from pathlib import Path
 
@@ -25,8 +26,8 @@ SCRIPT_DIR = Path(__file__).parent
 POCKET_CURSOR_SCRIPT = SCRIPT_DIR / 'pocket_cursor.py'
 
 
-def find_pids():
-    """Find PIDs of running PocketCursor processes via wmic."""
+def find_pids_wmic():
+    """Find PIDs via wmic (missing on some Windows installs)."""
     try:
         result = subprocess.run(
             ['wmic', 'process', 'where',
@@ -41,8 +42,39 @@ def find_pids():
                 pids.append(int(line))
         return pids
     except Exception as e:
-        print(f"Warning: Could not query processes: {e}")
+        print(f"Warning: wmic query failed: {e}")
         return []
+
+
+def find_pids_powershell():
+    """Fallback when wmic is unavailable — same logic as wmic."""
+    ps = (
+        "Get-CimInstance Win32_Process | Where-Object { "
+        "$_.CommandLine -match 'pocket_cursor[.]py' -and "
+        "$_.CommandLine -notmatch 'restart_pocket_cursor' -and "
+        "$_.CommandLine -notmatch 'wmic' "
+        "} | ForEach-Object { $_.ProcessId }"
+    )
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30
+        )
+        pids = []
+        for line in (result.stdout or '').splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        return pids
+    except Exception as e:
+        print(f"Warning: PowerShell process query failed: {e}")
+        return []
+
+
+def find_pids():
+    """All PIDs running pocket_cursor.py (bridge only, not restart script)."""
+    merged = set(find_pids_wmic()) | set(find_pids_powershell())
+    return sorted(merged)
 
 
 def kill_processes(pids):
@@ -59,19 +91,25 @@ def kill_processes(pids):
 
 
 def main():
-    # 1. Find and kill existing PocketCursor processes
+    # 1. Find and kill existing PocketCursor processes (multiple instances = duplicate Telegram messages)
     pids = find_pids()
     if pids:
         print(f"Found {len(pids)} PocketCursor process(es): {pids}")
         kill_processes(pids)
+        time.sleep(0.8)
+        still = find_pids()
+        if still:
+            print(f"WARNING: Still running after taskkill: {still} — retrying...")
+            kill_processes(still)
+            time.sleep(0.8)
     else:
         print("No running PocketCursor found.")
 
-    # 2. Clean stale lock file
+    # 2. Remove lock only after kill attempts (old script deleted lock even when kill failed → many bridges)
     lock_file = SCRIPT_DIR / '.bridge.lock'
     if lock_file.exists():
         lock_file.unlink()
-        print("Removed stale lock file.")
+        print("Removed lock file before start.")
 
     # 3. Start PocketCursor as subprocess and wait (keeps parent alive so
     #    Cursor terminal tracking is preserved — os.execv on Windows

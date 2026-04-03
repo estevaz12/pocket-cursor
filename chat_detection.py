@@ -129,6 +129,15 @@ _LISTENER_JS = r"""
                 return { name: a.getAttribute('aria-label') || a.textContent.trim(), pc_id: pcId };
             }
         }
+        const unifiedCell = document.querySelector('.unified-agents-sidebar .agent-sidebar-cell[data-selected="true"]');
+        if (unifiedCell) {
+            const textEl = unifiedCell.querySelector('.agent-sidebar-cell-text');
+            const name = textEl ? textEl.textContent.trim() : '';
+            if (name) {
+                const pcId = hasCid ? tagWithCid(unifiedCell, cid) : ensurePcId(unifiedCell);
+                return { name: name, pc_id: pcId };
+            }
+        }
         return null;
     }
 
@@ -138,6 +147,14 @@ _LISTENER_JS = r"""
             if (tabName === name) {
                 const li = a.closest('li');
                 return li ? ensurePcId(li) : '';
+            }
+        }
+        for (const cell of document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell')) {
+            if (cell.getAttribute('data-selected') === null) continue;
+            const textEl = cell.querySelector('.agent-sidebar-cell-text');
+            const tabName = textEl ? textEl.textContent.trim() : '';
+            if (tabName === name) {
+                return ensurePcId(cell);
             }
         }
         for (const label of document.querySelectorAll('.tab .composer-tab-label')) {
@@ -153,7 +170,8 @@ _LISTENER_JS = r"""
         const pcEl = el.closest('[data-pc-id]');
         if (pcEl) {
             const label = pcEl.querySelector('.composer-tab-label')
-                       || pcEl.querySelector('a[aria-id="chat-horizontal-tab"]');
+                       || pcEl.querySelector('a[aria-id="chat-horizontal-tab"]')
+                       || pcEl.querySelector('.agent-sidebar-cell-text');
             if (label) return { name: label.getAttribute('aria-label') || label.textContent.trim(), pc_id: pcEl.getAttribute('data-pc-id') };
         }
         const chatIcon = el.closest('.codicon-chat');
@@ -271,12 +289,24 @@ _LIST_CHATS_JS = r"""
         return msgs[msgs.length - 1].getAttribute('data-message-id');
     }
 
+    // Deterministic id when Cursor has no stable uuid (replaces Math.random so IDs survive sidebar rebuilds
+    // and stay consistent across list_chats runs for the same visible row + title).
+    function stablePcId(kind, idx, label) {
+        const s = kind + ':' + String(idx) + ':' + (label || '');
+        let h = 2166136261;
+        for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+        }
+        return 'pc-' + kind + (h >>> 0).toString(36).slice(0, 11);
+    }
+
     const usedPcIds = new Set();
 
     // 1. Editor-group tabs first (stable cids from data-resource-name)
     document.querySelectorAll('.editor-group-container').forEach(group => {
         const tabs = group.querySelectorAll('.tab .composer-tab-label');
-        tabs.forEach(label => {
+        tabs.forEach((label, tidx) => {
             const tabEl = label.closest('.tab');
             if (!tabEl) return;
             const name = label.textContent.trim();
@@ -286,7 +316,7 @@ _LIST_CHATS_JS = r"""
                 if (/^[0-9a-f]{8}-/.test(resName)) {
                     pcId = tagWithCid(tabEl, resName);
                 } else if (!pcId) {
-                    pcId = 'pc-' + Math.random().toString(36).slice(2, 10);
+                    pcId = stablePcId('e', tidx, name);
                     tabEl.setAttribute('data-pc-id', pcId);
                 }
             }
@@ -311,11 +341,12 @@ _LIST_CHATS_JS = r"""
     const activeMsgId = composerPanel ? lastHumanMsgId(composerPanel) : null;
 
     const agentTabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
-    agentTabs.forEach(a => {
+    agentTabs.forEach((a, aidx) => {
         const li = a.closest('li');
         if (!li) return;
         let pcId = li.getAttribute('data-pc-id');
         const isChecked = li.classList.contains('checked');
+        const tabLabel = a.getAttribute('aria-label') || a.textContent.trim() || '';
         if (isChecked) {
             const cid = getComposerId();
             if (cid) {
@@ -327,7 +358,7 @@ _LIST_CHATS_JS = r"""
         }
         if (!pcId || !pcId.startsWith('cid-')) {
             if (!pcId) {
-                pcId = 'pc-' + Math.random().toString(36).slice(2, 10);
+                pcId = stablePcId('t', aidx, tabLabel);
                 li.setAttribute('data-pc-id', pcId);
             }
         }
@@ -335,6 +366,49 @@ _LIST_CHATS_JS = r"""
         const entry = {
             pc_id: pcId,
             name: a.getAttribute('aria-label') || a.textContent.trim() || '',
+            active: isChecked
+        };
+        if (isChecked && activeMsgId) entry.msg_id = activeMsgId;
+        results.push(entry);
+    });
+
+    // 3. Unified agents sidebar (new Cursor UI)
+    const unifiedCells = document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell');
+    unifiedCells.forEach((cell, uidx) => {
+        if (cell.getAttribute('data-selected') === null) return;
+        let pcId = cell.getAttribute('data-pc-id');
+        const isChecked = cell.getAttribute('data-selected') === 'true';
+        const textEl0 = cell.querySelector('.agent-sidebar-cell-text')
+            || cell.querySelector('[class*="sidebar-cell-text"]')
+            || cell.querySelector('[class*="cell-text"]');
+        let title0 = textEl0 ? textEl0.textContent.trim() : '';
+        if (!title0) {
+            const al = cell.getAttribute('aria-label');
+            if (al) title0 = al.trim();
+        }
+        if (!title0) {
+            title0 = (cell.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        }
+
+        if (isChecked && activeMsgId) {
+            const cid = getComposerId();
+            if (cid) {
+                const newPcId = cidFromUuid(cid);
+                if (!usedPcIds.has(newPcId)) {
+                    pcId = tagWithCid(cell, cid);
+                }
+            }
+        }
+        if (!pcId || !pcId.startsWith('cid-')) {
+            if (!pcId) {
+                pcId = stablePcId('u', uidx, title0);
+                cell.setAttribute('data-pc-id', pcId);
+            }
+        }
+        usedPcIds.add(pcId);
+        const entry = {
+            pc_id: pcId,
+            name: title0,
             active: isChecked
         };
         if (isChecked && activeMsgId) entry.msg_id = activeMsgId;

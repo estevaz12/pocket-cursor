@@ -331,6 +331,7 @@ def transcribe_voice(audio_bytes, filename='voice.ogg'):
 # ── CDP helpers ──────────────────────────────────────────────────────────────
 
 def detect_cdp_port(exit_on_fail=True):
+    return 9222
     """Auto-detect the CDP port from running Cursor processes.
     
     Uses start_cursor.get_used_ports() to parse process command lines,
@@ -411,6 +412,24 @@ _switch_lock = threading.Lock()
 _switch_debounce_lock = threading.Lock()
 _switch_debounce_timer = None
 _switch_debounce_pre_pcid = None
+_last_chat_activated_mono = 0.0
+_CHAT_ACTIVATED_COOLDOWN_S = 25.0
+
+
+def _send_chat_activated_telegram(text: str) -> None:
+    """At most one 'Chat activated' every COOLDOWN seconds (any text) — DOM listeners can race."""
+    global _last_chat_activated_mono
+    if not chat_id or muted:
+        return
+    now = time.monotonic()
+    if now - _last_chat_activated_mono < _CHAT_ACTIVATED_COOLDOWN_S:
+        return
+    _last_chat_activated_mono = now
+    try:
+        tg_send(chat_id, text)
+    except Exception:
+        pass
+
 
 def _handle_chat_switch(iid, data):
     """Called by chat listener thread when user switches to a different chat.
@@ -462,10 +481,7 @@ def _handle_chat_switch(iid, data):
                 if pre == pid:
                     print(f"[dom] Suppressed notification (returned to same chat: {n})")
                     return
-                try:
-                    tg_send(chat_id, f"💬 Chat activated: {n}  ({wsl})")
-                except Exception:
-                    pass
+                _send_chat_activated_telegram(f"💬 Chat activated: {n}  ({wsl})")
 
             _switch_debounce_timer = threading.Timer(1.5, _fire)
             _switch_debounce_timer.start()
@@ -1366,7 +1382,9 @@ def cursor_get_active_conv():
     return cdp_eval("""
         (function() {
             const tab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
-            return tab ? tab.getAttribute('aria-label') : '';
+            if (tab) return tab.getAttribute('aria-label') || '';
+            const unified = document.querySelector('.unified-agents-sidebar .agent-sidebar-cell[data-selected="true"] .agent-sidebar-cell-text');
+            return unified ? unified.textContent.trim() : '';
         })();
     """) or ''
 
@@ -1375,11 +1393,27 @@ def cursor_list_convs():
     """List all conversation tabs. Returns [{name, active}]."""
     result = cdp_eval("""
         (function() {
-            const tabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
-            return JSON.stringify(Array.from(tabs).map((a, i) => ({
-                name: a.getAttribute('aria-label') || '',
-                active: a.closest('li').classList.contains('checked')
-            })));
+            const agentAnchors = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
+            const rows = [];
+            if (agentAnchors.length > 0) {
+                agentAnchors.forEach(a => {
+                    const li = a.closest('li');
+                    rows.push({
+                        name: a.getAttribute('aria-label') || '',
+                        active: li ? li.classList.contains('checked') : false
+                    });
+                });
+            } else {
+                document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell').forEach(cell => {
+                    if (cell.getAttribute('data-selected') === null) return;
+                    const textEl = cell.querySelector('.agent-sidebar-cell-text');
+                    rows.push({
+                        name: textEl ? textEl.textContent.trim() : '',
+                        active: cell.getAttribute('data-selected') === 'true'
+                    });
+                });
+            }
+            return JSON.stringify(rows);
         })();
     """)
     try:
@@ -1393,10 +1427,21 @@ def cursor_switch_conv(index):
     return cdp_eval(f"""
         (function() {{
             const tabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
-            if ({index} >= tabs.length) return 'ERROR: only ' + tabs.length + ' tabs open';
-            const tab = tabs[{index}];
-            tab.click();
-            return tab.getAttribute('aria-label') || 'OK';
+            if (tabs.length > 0) {{
+                if ({index} >= tabs.length) return 'ERROR: only ' + tabs.length + ' tabs open';
+                const tab = tabs[{index}];
+                tab.click();
+                return tab.getAttribute('aria-label') || 'OK';
+            }}
+            const cells = [];
+            document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell').forEach(cell => {{
+                if (cell.getAttribute('data-selected') !== null) cells.push(cell);
+            }});
+            if ({index} >= cells.length) return 'ERROR: only ' + cells.length + ' chats open';
+            const cell = cells[{index}];
+            cell.click();
+            const textEl = cell.querySelector('.agent-sidebar-cell-text');
+            return textEl ? textEl.textContent.trim() : 'OK';
         }})();
     """)
 
@@ -1578,18 +1623,19 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                     // Cursor removes thinking content from DOM when collapsed.
                     // If collapsed, click the header to expand so we can read
                     // the content on the next tick.
-                    let root = msg.querySelector('.anysphere-markdown-container-root');
+                    let root = msg.querySelector('.anysphere-markdown-container-root') || msg.querySelector('.markdown-root');
                     if (!root) {
                         const header = msg.querySelector('.collapsible-thought > div:first-child');
                         if (header) header.click();
                     }
-                    // Walk sections with getSectionText to preserve list numbering.
-                    // textContent/innerText lose CSS-generated <ol> counters.
                     let thinkText = '';
                     if (root) {
+                        const childList = root.classList.contains('markdown-root')
+                            ? (root.firstElementChild ? Array.from(root.firstElementChild.children) : Array.from(root.children))
+                            : Array.from(root.children);
                         const parts = [];
-                        for (const child of root.children) {
-                            if (child.classList.contains('markdown-section')) {
+                        for (const child of childList) {
+                            if (child.classList.contains('markdown-section') || root.classList.contains('markdown-root')) {
                                 const t = getSectionText(child);
                                 if (t) parts.push(t);
                             }
@@ -1607,20 +1653,23 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 }
 
                 // --- AI text messages (markdown sections, code blocks + tables) ---
-                const root = msg.querySelector('.anysphere-markdown-container-root');
+                const root = msg.querySelector('.anysphere-markdown-container-root') || msg.querySelector('.markdown-root');
                 if (!root) return;
                 let tableIndex = 0;
 
-                let codeBlockIndex = 0;
-                for (const child of root.children) {
-                    if (child.classList.contains('markdown-section')) {
-                        // Code blocks live inside markdown-section but should be screenshotted
-                        const codeBlock = child.querySelector('.markdown-block-code');
+                const childList = root.classList.contains('markdown-root')
+                    ? (root.firstElementChild ? Array.from(root.firstElementChild.children) : Array.from(root.children))
+                    : Array.from(root.children);
+
+                for (const child of childList) {
+                    if (child.classList.contains('markdown-section') || root.classList.contains('markdown-root')) {
+                        const codeBlock = child.querySelector('.markdown-block-code')
+                            || (child.tagName === 'PRE' ? child : child.querySelector('pre'));
                         const latexBlock = child.querySelector('.markdown-block-latex');
+                        const isTable = child.classList.contains('markdown-table-container')
+                            || child.tagName === 'TABLE' || !!child.querySelector('table');
                         if (codeBlock) {
                             const text = child.innerText.trim();
-                            // Use the section's unique DOM id for a reliable selector
-                            // (:nth-of-type breaks because each code block is in a different parent section)
                             const selector = child.id
                                 ? '#' + child.id + ' .markdown-block-code'
                                 : '#bubble-' + bubbleSuffix + ' .markdown-block-code';
@@ -1655,6 +1704,16 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                                 selector: selector
                             });
                             subIdx++;
+                        } else if (isTable) {
+                            const text = child.innerText.trim();
+                            sections.push({
+                                text: text,
+                                type: 'table',
+                                id: child.id || ('gen:' + msgId + ':' + subIdx),
+                                selector: child.id ? '#' + child.id : '#bubble-' + bubbleSuffix + ' table'
+                            });
+                            subIdx++;
+                            tableIndex++;
                         } else {
                             const text = getSectionText(child);
                             if (text.length > 0) {
@@ -1684,9 +1743,13 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 }
             });
 
-            // Active conversation name from the checked tab (scoped to agent-tabs to avoid terminal tabs)
+            // Active conversation name: checked agent tab or unified sidebar
             const convTab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
-            const convName = convTab ? convTab.getAttribute('aria-label') : '';
+            let convName = convTab ? convTab.getAttribute('aria-label') : '';
+            if (!convName) {
+                const unified = document.querySelector('.unified-agents-sidebar .agent-sidebar-cell[data-selected="true"] .agent-sidebar-cell-text');
+                if (unified) convName = unified.textContent.trim();
+            }
 
             return JSON.stringify({ turn_id: turnId, user_full: userFull, sections: sections, images: images, conv: convName });
         })();
@@ -1790,23 +1853,105 @@ def sender_thread():
                             if not info:
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text='Instance not found')
                                 continue
+                            try:
+                                fresh_rows = list_chats(lambda js: cdp_eval_on(info['ws'], js))
+                            except Exception as e:
+                                print(f"[sender] list_chats before chat switch: {e}")
+                                fresh_rows = []
+                            convs = info.get('convs') or {}
+                            if target_pc_id not in convs:
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id,
+                                        text='Chat list outdated — tap /chats then pick again')
+                                print(f"[sender] Unknown pc_id in registry: {target_pc_id!r}")
+                                continue
+
+                            reg = convs[target_pc_id]
+                            reg_name = (reg.get('name') or '').strip()
+
+                            def _norm_chat_title(s):
+                                return ' '.join((s or '').split()).lower()
+
+                            row = next((r for r in fresh_rows if r.get('pc_id') == target_pc_id), None)
+                            if not row and reg_name:
+                                row = next(
+                                    (r for r in fresh_rows if (r.get('name') or '').strip() == reg_name),
+                                    None,
+                                )
+                            if not row and reg_name:
+                                rn = _norm_chat_title(reg_name)
+                                for r in fresh_rows:
+                                    if _norm_chat_title(r.get('name')) == rn:
+                                        row = r
+                                        break
+
+                            if not row:
+                                tg_call('answerCallbackQuery', callback_query_id=cb_id,
+                                        text='Could not find that chat — send /chats and try again')
+                                print(f"[sender] No fresh row for pc_id={target_pc_id!r} name={reg_name!r} (got {len(fresh_rows)} rows)")
+                                continue
+
+                            resolved_pc_id = row['pc_id']
+                            resolved_name = (row.get('name') or reg_name or '').strip()
                             # Click the tab with matching data-pc-id (works for both agent-tabs and editor-group tabs)
-                            # Note: querySelectorAll because file tabs can share the same data-pc-id
-                            # as adjacent chat tabs — we filter for the actual chat tab.
+                            # Note: filter [data-pc-id] by value so ids never break CSS quoting.
+                            # Uses resolved_pc_id from fresh list_chats (ids can rotate when the sidebar rebuilds).
                             result = cdp_eval_on(info['ws'], f"""
                                 (function() {{
-                                    const candidates = document.querySelectorAll('[data-pc-id="{target_pc_id}"]');
+                                    const targetPcId = {json.dumps(resolved_pc_id)};
+                                    const nameHint = {json.dumps(resolved_name)};
+                                    function normChatTitle(s) {{
+                                        return (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                    }}
+                                    function unifiedCellTitle(cell) {{
+                                        const te = cell.querySelector('.agent-sidebar-cell-text')
+                                            || cell.querySelector('[class*="sidebar-cell-text"]')
+                                            || cell.querySelector('[class*="cell-text"]');
+                                        if (te) return te.textContent.trim();
+                                        const al = cell.getAttribute('aria-label');
+                                        if (al) return al.trim();
+                                        return (cell.textContent || '').replace(/\\s+/g, ' ').trim();
+                                    }}
+                                    const candidates = Array.from(document.querySelectorAll('[data-pc-id]')).filter(
+                                        function(n) {{ return n.getAttribute('data-pc-id') === targetPcId; }});
                                     let el = null;
                                     for (const c of candidates) {{
-                                        // Agent-tab: <li> with chat link
                                         if (c.querySelector('a[aria-id="chat-horizontal-tab"]')) {{ el = c; break; }}
-                                        // Editor-group tab: has .composer-tab-label
                                         if (c.querySelector('.composer-tab-label')) {{ el = c; break; }}
+                                        if (c.classList && c.classList.contains('agent-sidebar-cell')) {{ el = c; break; }}
                                     }}
-                                    if (!el) return 'ERROR: tab not found (pc_id={target_pc_id}, checked ' + candidates.length + ' candidates)';
+                                    if (!el && nameHint) {{
+                                        const w = normChatTitle(nameHint);
+                                        for (const cell of document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell')) {{
+                                            if (cell.getAttribute('data-selected') === null) continue;
+                                            const g = normChatTitle(unifiedCellTitle(cell));
+                                            if (g && g === w) {{ el = cell; break; }}
+                                        }}
+                                        if (!el && w.length >= 3) {{
+                                            for (const cell of document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell')) {{
+                                                if (cell.getAttribute('data-selected') === null) continue;
+                                                const g = normChatTitle(unifiedCellTitle(cell));
+                                                if (g && (g.indexOf(w) >= 0 || w.indexOf(g) >= 0)) {{ el = cell; break; }}
+                                            }}
+                                        }}
+                                    }}
+                                    if (!el && nameHint) {{
+                                        const w = normChatTitle(nameHint);
+                                        for (const a of document.querySelectorAll('[class*="agent-tabs"] li a[aria-id="chat-horizontal-tab"]')) {{
+                                            const lab = a.getAttribute('aria-label') || a.textContent.trim();
+                                            const g = normChatTitle(lab);
+                                            if (g === w) {{ el = a.closest('li'); break; }}
+                                        }}
+                                    }}
+                                    if (!el) return 'ERROR: tab not found (pc_id=' + targetPcId + ', name=' + (nameHint || '?') + ', checked ' + candidates.length + ' id candidates)';
                                     // Agent-tab: click the <a> inside the <li>
                                     const a = el.querySelector('a[aria-id="chat-horizontal-tab"]');
                                     if (a) {{ a.click(); return a.getAttribute('aria-label') || 'OK'; }}
+                                    // Unified sidebar cell
+                                    if (el.classList && el.classList.contains('agent-sidebar-cell')) {{
+                                        el.click();
+                                        const ut = unifiedCellTitle(el);
+                                        return ut || 'OK';
+                                    }}
                                     // Editor-group tab: use mousedown (VS Code activates tabs on mousedown, not click)
                                     el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, button: 0}}));
                                     const label = el.querySelector('.label-name');
@@ -1828,11 +1973,11 @@ def sender_thread():
                                     except Exception as e:
                                         print(f"[sender] Could not bring window to front: {e}")
                                 # Update mirrored_chat immediately (don't wait for overview thread)
-                                chat_name = result if result and result != 'OK' else target_pc_id
-                                mirrored_chat = (target_iid, target_pc_id, chat_name)
+                                chat_label = result if result and result != 'OK' else (resolved_name or resolved_pc_id)
+                                mirrored_chat = (target_iid, resolved_pc_id, chat_label)
                                 ws_label = (info.get('workspace') or '?').removesuffix(' (Workspace)')
                                 tg_call('answerCallbackQuery', callback_query_id=cb_id, text=f'Switched')
-                                _save_active_chat(info.get('workspace'), chat_name, target_pc_id)
+                                _save_active_chat(info.get('workspace'), chat_label, resolved_pc_id)
                             print(f"[sender] Agent switch: {result}")
                         else:
                             # Legacy format: agent:{index}
@@ -2052,22 +2197,32 @@ def sender_thread():
                     continue
 
                 if text in ('/chats', '/agents', '/agent'):
-                    grouped = {}
-                    for iid, info in instance_registry.items():
-                        convs = info.get('convs', {})
-                        if not convs:
-                            continue
-                        ws_name = (info['workspace'] or '(no workspace)').removesuffix(' (Workspace)')
-                        if ws_name not in grouped:
-                            grouped[ws_name] = []
+                    # Single Telegram message — previously we sent one per workspace key (N workspaces => N pings).
+                    keyboard_rows = []
+                    inst_with = [(iid, inf) for iid, inf in instance_registry.items() if inf.get('convs')]
+                    multi = len(inst_with) > 1
+                    for iid, info in inst_with:
+                        convs = info['convs']
                         for pc_id, conv in convs.items():
                             is_mirrored = mirrored_chat and mirrored_chat[0] == iid and mirrored_chat[1] == pc_id
-                            prefix = '▶ ' if is_mirrored else ''
-                            grouped[ws_name].append([{'text': f"{prefix}{conv['name']}", 'callback_data': f"chat:{iid}:{pc_id}"}])
-                    if grouped:
-                        for ws_name, keyboard in grouped.items():
-                            tg_call('sendMessage', chat_id=cid, text=f'📂 {ws_name}',
-                                    reply_markup={'inline_keyboard': keyboard})
+                            star = '▶ ' if is_mirrored else ''
+                            name = (conv.get('name') if isinstance(conv, dict) else None) or '(unnamed)'
+                            label = f"{star}[{iid[:8]}] {name}" if multi else f"{star}{name}"
+                            if len(label) > 64:
+                                label = label[:61] + '…'
+                            keyboard_rows.append(
+                                [{'text': label, 'callback_data': f"chat:{iid}:{pc_id}"}])
+                    if keyboard_rows:
+                        n = len(keyboard_rows)
+                        body = f"📂 {n} chat(s) — tap to mirror"
+                        if multi:
+                            body += "\n[iid] = Cursor window id when multiple instances are open."
+                        tg_call(
+                            'sendMessage',
+                            chat_id=cid,
+                            text=body[:4096],
+                            reply_markup={'inline_keyboard': keyboard_rows},
+                        )
                     else:
                         tg_send(cid, "No open chats right now.")
                     continue
@@ -2238,16 +2393,15 @@ def monitor_thread():
             if turn_id != last_turn_id:
                 if not initialized:
                     print(f"[monitor] Init: '{user_full[:50]}', skipping {len(sections)} existing")
-                    if not muted and conv:
+                    # Do not tg_send "Chat activated" here — _handle_chat_switch already notifies on
+                    # in-app chat switches, and duplicate monitor + DOM messages spam the user (4+ hits).
+                    if conv:
                         mc = mirrored_chat
                         ws_label = ''
                         if mc:
                             info = instance_registry.get(mc[0], {})
                             ws_label = (info.get('workspace') or '').removesuffix(' (Workspace)')
-                        if ws_label:
-                            tg_send(cid, f"💬 Chat activated: {conv}  ({ws_label})")
-                        else:
-                            tg_send(cid, f"💬 Chat activated: {conv}")
+                        print(f"[monitor] Active conv: {conv}" + (f'  ({ws_label})' if ws_label else ''))
                     forwarded_ids = {
                         sec.get('id', '') for sec in sections
                         if isinstance(sec, dict) and sec.get('id')
@@ -2713,6 +2867,7 @@ def overview_thread():
             # Scan conversations per instance. Each CDP target gets its own scan
             # because detached windows have distinct DOMs despite sharing a workspace name.
             scan_summary = {}
+            rename_digest = []
             for iid, info in list(instance_registry.items()):
                 ws_name = info['workspace']
                 if not ws_name:
@@ -2790,11 +2945,16 @@ def overview_thread():
                     if pc_id in known_convs and known_convs[pc_id]['name'] != conv['name']:
                         old_name = known_convs[pc_id]['name']
                         print(f"[overview] Conversation renamed: {old_name} → {conv['name']}  in {ws_label}")
-                        if chat_id and not muted:
-                            tg_send(chat_id, f"💬 Chat renamed: {old_name} → {conv['name']}  ({ws_label})")
+                        rename_digest.append((old_name, conv['name'], ws_label))
 
                 info['convs'] = {pc_id: {'name': c['name'], 'active': c['active'], 'msg_id': c.get('msg_id')} for pc_id, c in current_convs.items()}
                 scan_summary[ws_label] = scan_summary.get(ws_label, 0) + len(convs)
+
+            if rename_digest and chat_id and not muted:
+                lines = [f"• {o} → {n}  ({w})" for o, n, w in rename_digest[:35]]
+                if len(rename_digest) > 35:
+                    lines.append(f"… +{len(rename_digest) - 35} more")
+                tg_send(chat_id, "💬 Renamed this scan:\n" + "\n".join(lines))
 
             if scan_summary:
                 parts = '  '.join(f"{ws} ({n})" for ws, n in scan_summary.items())
@@ -2882,14 +3042,22 @@ def outbox_render_and_send(filename, cid, caption=None):
 _lock_file = Path(__file__).parent / '.bridge.lock'
 
 def _is_process_alive(pid):
-    """Check if a process is truly alive (not just a stale handle) on Windows."""
+    """Check if another bridge process is still running (single-instance guard)."""
+    if sys.platform != 'win32':
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
     import ctypes
     kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(0x0400 | 0x1000, False, pid)  # PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel32.OpenProcess(0x0400 | 0x1000, False, pid)
     if not handle:
-        return False
+        # Cannot query — assume alive so we never start a second bridge by mistake
+        # (duplicate bridges = every Telegram message repeated N times).
+        print(f"[bridge] Could not query PID {pid}; if no bridge is running, delete {_lock_file} and retry.")
+        return True
     try:
-        # GetExitCodeProcess returns STILL_ACTIVE (259) for running processes
         exit_code = ctypes.c_ulong()
         kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
         return exit_code.value == 259  # STILL_ACTIVE
@@ -2945,6 +3113,10 @@ print("Connected.")
 
 print(f"\nPocketCursor Bridge v2 running!")
 print(f"Send a message to @{bot['username']} on Telegram.")
+print(
+    "[bridge] If every message appears 2–5×, stop duplicate python.exe processes "
+    "(run restart_pocket_cursor.py or Task Manager → end tasks running pocket_cursor.py)."
+)
 if OWNER_ID:
     print(f"Owner: {OWNER_ID}")
 if chat_id:

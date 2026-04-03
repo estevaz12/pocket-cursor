@@ -1,0 +1,2 @@
+# Dev-only: pip install -r requirements-dev.txt
+pytest>=8.0.0
