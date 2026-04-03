@@ -157,16 +157,30 @@ def _primary_route() -> RouteKey | None:
 
 
 def _mirror_for_inbound(route: RouteKey) -> tuple[str, str, str] | None:
-    """Resolve Cursor mirror for a Telegram route; seed forum topic from primary DM route."""
+    """Resolve Cursor mirror for a Telegram route (exact RouteKey only).
+
+    We intentionally do **not** fall back to ``RouteKey(chat_id, None)`` when the message has
+    a forum ``message_thread_id``. That fallback would map every topic to the same Cursor chat
+    as the General / legacy row and break per-topic routing.
+    """
     with mirrored_chats_lock:
-        if route in mirrored_chats:
-            return mirrored_chats[route]
-        primary = RouteKey(route.chat_id, None)
-        if primary in mirrored_chats:
-            mirrored_chats[route] = mirrored_chats[primary]
-            _persist_mirrored_routes()
-            return mirrored_chats[route]
-    return None
+        return mirrored_chats.get(route)
+
+
+_FORUM_TOPIC_UNBOUND = (
+    'This forum topic is not linked to a Cursor chat yet. '
+    'Focus that agent tab in Cursor so the bridge can bind it, then send again.'
+)
+
+
+def _forum_topic_requires_mirror(route: RouteKey) -> bool:
+    """True if we must have a per-topic binding (no silent fallback to the active Cursor tab)."""
+    if FORUM_CHAT_ID is None or route.message_thread_id is None:
+        return False
+    if route.chat_id != FORUM_CHAT_ID:
+        return False
+    with mirrored_chats_lock:
+        return route not in mirrored_chats
 
 
 def _persist_mirrored_routes() -> None:
@@ -2629,6 +2643,9 @@ def sender_thread():
 
                 # Handle photo messages (from phone gallery, camera, etc.)
                 if photo:
+                    if _forum_topic_requires_mirror(route):
+                        tg_send(cid, _FORUM_TOPIC_UNBOUND, message_thread_id=thr)
+                        continue
                     print(f'[sender] {user}: [photo] {caption}')
                     tg_typing(cid, message_thread_id=thr)
                     _mc = _mirror_for_inbound(route)
@@ -2679,6 +2696,9 @@ def sender_thread():
 
                 # Handle voice messages
                 if voice:
+                    if _forum_topic_requires_mirror(route):
+                        tg_send(cid, _FORUM_TOPIC_UNBOUND, message_thread_id=thr)
+                        continue
                     print(f'[sender] {user}: [voice] {voice.get("duration", "?")}s')
                     tg_typing(cid, message_thread_id=thr)
                     file_id = voice['file_id']
@@ -2832,6 +2852,10 @@ def sender_thread():
                         tg_send(cid, 'No open chats right now.', message_thread_id=thr)
                     continue
 
+                if _forum_topic_requires_mirror(route):
+                    tg_send(cid, _FORUM_TOPIC_UNBOUND, message_thread_id=thr)
+                    continue
+
                 # Record what we're sending (so monitor knows which turn is ours)
                 with last_sent_lock:
                     last_sent_by_route[route] = text
@@ -2963,6 +2987,10 @@ def monitor_thread():
                 routes_list = list(mirrored_chats.items())
             if not routes_list:
                 continue
+
+            # Same Cursor composer may be registered under multiple RouteKeys (e.g. DM + forum);
+            # only prefill context-monitor text once per tick per (instance, pc_id).
+            context_prefill_done: set[tuple[str, str]] = set()
 
             for route, mc in routes_list:
                 st = route_states.setdefault(route, _new_monitor_state())
@@ -3177,11 +3205,14 @@ def monitor_thread():
                                         lines.append(f'  {name}: {pct:.1f}%')
                                 print('\n'.join(lines))
                             if ann:
-                                try:
-                                    cursor_prefill_input(ann, conn=mc_conn)
-                                    print(f'[context-monitor] Prefilled: {ann}')
-                                except Exception as e:
-                                    print(f'[context-monitor] Failed to prefill: {e}')
+                                dedup_key = (mc[0], mc[1])
+                                if dedup_key not in context_prefill_done:
+                                    context_prefill_done.add(dedup_key)
+                                    try:
+                                        cursor_prefill_input(ann, conn=mc_conn)
+                                        print(f'[context-monitor] Prefilled: {ann}')
+                                    except Exception as e:
+                                        print(f'[context-monitor] Failed to prefill: {e}')
 
                         if not from_telegram:
                             if not muted and user_full:
