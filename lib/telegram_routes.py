@@ -85,6 +85,18 @@ def save_routes_json(path: Path, routes: Mapping[RouteKey, Mapping[str, Any]]) -
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
+def forum_topic_title(chat_name: str, pc_id: str) -> str:
+    """Build a Telegram forum topic name (max 128 chars, single line)."""
+    base = ' '.join((chat_name or '').split()).strip() or 'Chat'
+    suffix = ''
+    if pc_id and pc_id.startswith('cid-') and len(pc_id) > 8:
+        suffix = f' ({pc_id[4:12]})'
+    max_base = max(1, 128 - len(suffix))
+    base = base[:max_base]
+    out = (base + suffix)[:128]
+    return out if out else 'Chat'
+
+
 def migrate_legacy_route_files(
     chat_id_file: Path,
     active_chat_file: Path,

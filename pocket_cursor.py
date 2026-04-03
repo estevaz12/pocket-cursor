@@ -43,6 +43,7 @@ from lib import command_rules
 from lib.observability import init_sentry
 from lib.telegram_routes import (
     RouteKey,
+    forum_topic_title,
     load_routes_json,
     migrate_legacy_route_files,
     route_key_from_message,
@@ -89,6 +90,15 @@ COMMAND_RULES = os.environ.get('COMMAND_RULES', '').lower() in ('true', '1', 'ye
 # Set in .env or auto-captured on first /start command
 _owner_raw = os.environ.get('TELEGRAM_OWNER_ID')
 OWNER_ID: int | None = int(_owner_raw) if _owner_raw else None
+_raw_forum = os.environ.get('TELEGRAM_FORUM_CHAT_ID', '').strip()
+FORUM_CHAT_ID: int | None = None
+if _raw_forum:
+    try:
+        FORUM_CHAT_ID = int(_raw_forum)
+    except ValueError:
+        print(
+            'WARNING: TELEGRAM_FORUM_CHAT_ID must be the numeric forum supergroup id (e.g. -100…)'
+        )
 owner_file = Path(__file__).parent / '.owner_id'
 chat_id_file = Path(__file__).parent / '.chat_id'
 active_chat_file = Path(__file__).parent / '.active_chat'
@@ -174,6 +184,74 @@ def _persist_mirrored_routes() -> None:
         save_routes_json(routes_file, bind)
     except OSError:
         pass
+
+
+def _find_forum_route_for_pc(forum_cid: int, iid: str, pc_id: str) -> RouteKey | None:
+    """Return the Telegram route for this Cursor chat in the forum, if any."""
+    with mirrored_chats_lock:
+        for rk, mc in mirrored_chats.items():
+            if (
+                rk.chat_id == forum_cid
+                and rk.message_thread_id is not None
+                and mc[0] == iid
+                and mc[1] == pc_id
+            ):
+                return rk
+    return None
+
+
+def tg_create_forum_topic(forum_chat_id: int, name: str) -> int | None:
+    """Create a forum topic; returns message_thread_id or None."""
+    result = tg_call('createForumTopic', chat_id=forum_chat_id, name=name[:128])
+    if not result.get('ok'):
+        return None
+    r = result.get('result') or {}
+    tid = r.get('message_thread_id')
+    return int(tid) if tid is not None else None
+
+
+def _ensure_forum_topic_for_cursor_chat(iid: str, pc_id: str, name: str) -> RouteKey | None:
+    """Ensure a Telegram forum topic exists for this Cursor chat; set mirror + last_sender_route.
+
+    Skips provisional tabs (pc-*). Requires TELEGRAM_FORUM_CHAT_ID and bot admin + Manage topics.
+    """
+    global last_sender_route
+    if FORUM_CHAT_ID is None:
+        return None
+    if pc_id.startswith('pc-'):
+        return None
+    title = forum_topic_title(name, pc_id)
+    existing = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id)
+    if existing:
+        with mirrored_chats_lock:
+            prev = mirrored_chats.get(existing)
+            if prev == (iid, pc_id, name):
+                last_sender_route = existing
+                return existing
+            mirrored_chats[existing] = (iid, pc_id, name)
+        _persist_mirrored_routes()
+        if prev and prev[2] != name:
+            tg_call(
+                'editForumTopic',
+                chat_id=FORUM_CHAT_ID,
+                message_thread_id=existing.message_thread_id,
+                name=title,
+            )
+        last_sender_route = existing
+        return existing
+    tid = tg_create_forum_topic(FORUM_CHAT_ID, title)
+    if tid is None:
+        print(
+            '[forum] createForumTopic failed — is the bot an admin with "Manage topics" in the forum?'
+        )
+        return None
+    rk = RouteKey(FORUM_CHAT_ID, tid)
+    with mirrored_chats_lock:
+        mirrored_chats[rk] = (iid, pc_id, name)
+    last_sender_route = rk
+    _persist_mirrored_routes()
+    print(f'[forum] Topic for {name!r} → thread_id={tid}')
+    return rk
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────────────
@@ -563,25 +641,41 @@ def _handle_chat_switch(iid, data):
     Debounces Telegram notifications (1.5s) to suppress rapid focus bounces
     that happen when Cursor moves a chat between sidebar and editor views.
     If the focus returns to the original chat (A->B->A), no notification is sent.
+
+    When TELEGRAM_FORUM_CHAT_ID is set, creates or reuses a forum topic per Cursor chat.
     """
-    global mirrored_chats, active_instance_id, ws
+    global mirrored_chats, active_instance_id, ws, last_sender_route
     global _switch_debounce_timer, _switch_debounce_pre_pcid
     pc_id = data.get('pc_id', '')
     name = data.get('name', '')
     if not pc_id:
         return
-    with _switch_lock:
-        rk = last_sender_route
-        if rk is None and chat_id is not None:
-            rk = RouteKey(chat_id, None)
-        cur_mc = mirrored_chats.get(rk) if rk else None
-        cur_iid = cur_mc[0] if cur_mc else None
-        cur_pc_id = cur_mc[1] if cur_mc else None
-        if iid == cur_iid and pc_id == cur_pc_id:
+
+    prev_rk = last_sender_route
+    prev_mc = mirrored_chats.get(prev_rk) if prev_rk else None
+    cur_pc_id_prev = prev_mc[1] if prev_mc else None
+    cur_iid_prev = prev_mc[0] if prev_mc else None
+
+    if FORUM_CHAT_ID is not None:
+        if pc_id.startswith('pc-'):
             return
-        same_chat_new_window = pc_id == cur_pc_id and iid != cur_iid
-        if rk is not None:
-            mirrored_chats[rk] = (iid, pc_id, name)
+        rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name)
+        if rk is None:
+            return
+        same_chat_new_window = pc_id == cur_pc_id_prev and iid != cur_iid_prev
+    else:
+        with _switch_lock:
+            rk = last_sender_route
+            if rk is None and chat_id is not None:
+                rk = RouteKey(chat_id, None)
+            cur_mc = mirrored_chats.get(rk) if rk else None
+            cur_iid = cur_mc[0] if cur_mc else None
+            cur_pc_id = cur_mc[1] if cur_mc else None
+            if iid == cur_iid and pc_id == cur_pc_id:
+                return
+            same_chat_new_window = pc_id == cur_pc_id and iid != cur_iid
+            if rk is not None:
+                mirrored_chats[rk] = (iid, pc_id, name)
     if iid != active_instance_id:
         with cdp_lock:
             active_instance_id = iid
@@ -601,7 +695,7 @@ def _handle_chat_switch(iid, data):
             if _switch_debounce_timer:
                 _switch_debounce_timer.cancel()
             else:
-                _switch_debounce_pre_pcid = cur_pc_id
+                _switch_debounce_pre_pcid = cur_pc_id_prev
 
             def _fire(n=name, wsl=ws_label, pid=pc_id):
                 global _switch_debounce_timer, _switch_debounce_pre_pcid
@@ -616,7 +710,8 @@ def _handle_chat_switch(iid, data):
 
             _switch_debounce_timer = threading.Timer(1.5, _fire)
             _switch_debounce_timer.start()
-    _persist_mirrored_routes()
+    if FORUM_CHAT_ID is None:
+        _persist_mirrored_routes()
     if CONTEXT_MONITOR:
         try:
             cursor_clear_input()
@@ -636,6 +731,15 @@ def _handle_chat_rename(iid, data):
             if mc[0] == iid and mc[1] == pc_id:
                 mirrored_chats[rk] = (iid, pc_id, name)
     _persist_mirrored_routes()
+    if FORUM_CHAT_ID is not None:
+        ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id)
+        if ex and ex.message_thread_id is not None:
+            tg_call(
+                'editForumTopic',
+                chat_id=FORUM_CHAT_ID,
+                message_thread_id=ex.message_thread_id,
+                name=forum_topic_title(name, pc_id),
+            )
     if CONTEXT_MONITOR and pc_id in _context_pct_names:
         _context_pct_names[pc_id] = name
         _save_context_pcts(pc_id=pc_id, chat_name=name)
@@ -3416,17 +3520,6 @@ def monitor_thread():
                     st['initialized'] = initialized
                     st['marked_done'] = marked_done
 
-                st['last_turn_id'] = last_turn_id
-                st['last_conv'] = last_conv
-                st['last_mc_pcid'] = last_mc_pcid
-                st['last_iid'] = last_iid
-                st['forwarded_ids'] = forwarded_ids
-                st['sent_this_turn'] = sent_this_turn
-                st['prev_by_id'] = prev_by_id
-                st['section_stable'] = section_stable
-                st['initialized'] = initialized
-                st['marked_done'] = marked_done
-
         except Exception as e:
             print(f'[monitor] Error: {e}')
             time.sleep(2)
@@ -3683,6 +3776,9 @@ def overview_thread():
                     print(
                         f'[overview] New conversation: {current_convs[pc_id]["name"]}  in {ws_label}'
                     )
+                    if FORUM_CHAT_ID is not None and not pc_id.startswith('pc-'):
+                        _nm = (current_convs[pc_id].get('name') or '').strip()
+                        _ensure_forum_topic_for_cursor_chat(iid, pc_id, _nm)
 
                 for pc_id in disappeared:
                     print(
@@ -3887,6 +3983,11 @@ if not _short.get('result', {}).get('short_description'):
 print('Connecting to Cursor via CDP...')
 cdp_connect()
 print('Connected.')
+if FORUM_CHAT_ID is not None:
+    print(
+        f'Forum auto-topics: TELEGRAM_FORUM_CHAT_ID={FORUM_CHAT_ID} '
+        '(bot must be admin with “Manage topics”)'
+    )
 
 print('\nPocketCursor Bridge v2 running!')
 print(f'Send a message to @{bot["username"]} on Telegram.')

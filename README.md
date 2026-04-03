@@ -107,7 +107,7 @@ python -X utf8 pocket_cursor.py
 
 Send any message to your bot on Telegram. It auto-pairs with the first user.
 
-**Forum topics (multiple agents in one group).** Add the bot to a **forum** supergroup (Topics enabled). Each topic has its own `message_thread_id`, so you can run `/chats` inside a topic and bind that topic to a different Cursor agent chat. Plain groups without topics share one thread and cannot be split this way. Bridge state is stored in `.telegram_routes.json` (plus legacy `.chat_id` / `.active_chat` migration on first run).
+**Forum topics (multiple agents in one group).** Add the bot to a **forum** supergroup (Topics enabled). Set **`TELEGRAM_FORUM_CHAT_ID`** in `.env` to the group’s numeric id (same format as Telegram `chat.id`, usually `-100…`). The bot must be an **administrator** with **Manage topics**. The bridge then calls Telegram’s `createForumTopic` for each Cursor agent chat when you switch to it (or when a new chat appears), and keeps topic titles in sync with Cursor chat names. You can still use `/chats` to bind manually if needed. Plain groups without topics cannot use per-topic routing. State is stored in `.telegram_routes.json` (plus legacy `.chat_id` / `.active_chat` migration on first run).
 
 If Cursor requires you to confirm command execution, a normal restart (kill + start) would lock you out. The bridge is offline between the two confirmations and you can't confirm the second one. This script kills and restarts in a single command, so you only confirm once:
 
