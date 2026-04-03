@@ -3,18 +3,11 @@
   "allow": [
     {
       "group": "PocketCursor scripts",
-      "patterns": [
-        "python *restart_pocket_cursor.py*"
-      ]
+      "patterns": ["python *restart_pocket_cursor.py*"]
     },
     {
       "group": "Git (read-only)",
-      "patterns": [
-        "git status*",
-        "git log*",
-        "git diff*",
-        "git branch*"
-      ]
+      "patterns": ["git status*", "git log*", "git diff*", "git branch*"]
     },
     {
       "group": "Web fetch (read-only)",
@@ -26,32 +19,19 @@
     },
     {
       "group": "Shell (read-only)",
-      "patterns": [
-        "ls *",
-        "dir *",
-        "cat *",
-        "head *",
-        "type *"
-      ]
+      "patterns": ["ls *", "dir *", "cat *", "head *", "type *"]
     },
     {
       "group": "Calendar (read-only)",
-      "patterns": [
-        "python *calendar_client.py* list*",
-        "python *calendar_client.py* --week*"
-      ]
+      "patterns": ["python *calendar_client.py* list*", "python *calendar_client.py* --week*"]
     },
     {
       "group": "PocketCursor voice",
-      "patterns": [
-        "python *voice_message.py*"
-      ]
+      "patterns": ["python *voice_message.py*"]
     },
     {
       "group": "Email/calendar watcher",
-      "patterns": [
-        "python *restart_watcher.py*"
-      ]
+      "patterns": ["python *restart_watcher.py*"]
     }
   ],
   "deny": [

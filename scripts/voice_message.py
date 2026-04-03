@@ -49,13 +49,17 @@ Environment variables (from .env):
     ELEVENLABS_PRONUNCIATION_WORD               - optional (default: disabled)
 """
 
-import sys
+import functools
 import io
 import json
-import functools
+import sys
 from pathlib import Path
 
-if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer') and getattr(sys.stdout, 'encoding', '').lower() != 'utf-8':
+if (
+    sys.platform == 'win32'
+    and hasattr(sys.stdout, 'buffer')
+    and getattr(sys.stdout, 'encoding', '').lower() != 'utf-8'
+):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -63,6 +67,7 @@ print = functools.partial(print, flush=True)
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv(Path(__file__).resolve().parent.parent / '.env')
 except ImportError:
     pass
@@ -73,6 +78,7 @@ import re
 import struct
 import subprocess
 from datetime import datetime
+
 import requests
 
 ELEVENLABS_KEY = os.environ.get('ELEVENLABS_API_KEY', '')
@@ -92,7 +98,9 @@ PRONUNCIATION_DICT_ID = os.environ.get('ELEVENLABS_PRONUNCIATION_DICT_ID', '')
 PRONUNCIATION_DICT_VERSION = os.environ.get('ELEVENLABS_PRONUNCIATION_DICT_VERSION', '')
 PRONUNCIATION_WORD = os.environ.get('ELEVENLABS_PRONUNCIATION_WORD', '')
 
-AUDIO_TAG_RE = re.compile(r'\[(?:excited|sad|whisper|angry|laughs|pause|slows down|rushed)\]', re.IGNORECASE)
+AUDIO_TAG_RE = re.compile(
+    r'\[(?:excited|sad|whisper|angry|laughs|pause|slows down|rushed)\]', re.IGNORECASE
+)
 
 _SAMPLE_RATE = 48000
 _WINDOW = _SAMPLE_RATE * 30 // 1000  # 30ms frames
@@ -105,8 +113,23 @@ def _audio_quality_log(opus_bytes, voice_id, model, language):
     Logs to stdout and appends to logs/voice_quality.jsonl (capped at 50 entries)."""
     try:
         result = subprocess.run(
-            ['ffmpeg', '-y', '-i', 'pipe:0', '-f', 's16le', '-ac', '1', '-ar', str(_SAMPLE_RATE), 'pipe:1'],
-            input=opus_bytes, capture_output=True, timeout=15)
+            [
+                'ffmpeg',
+                '-y',
+                '-i',
+                'pipe:0',
+                '-f',
+                's16le',
+                '-ac',
+                '1',
+                '-ar',
+                str(_SAMPLE_RATE),
+                'pipe:1',
+            ],
+            input=opus_bytes,
+            capture_output=True,
+            timeout=15,
+        )
         if result.returncode != 0:
             return
         raw = result.stdout
@@ -122,23 +145,28 @@ def _audio_quality_log(opus_bytes, voice_id, model, language):
         peak = max(abs(s) for s in head) / 32768.0
         max_crest = 0.0
         for i in range(n_frames):
-            frame = head[i * _WINDOW:(i + 1) * _WINDOW]
+            frame = head[i * _WINDOW : (i + 1) * _WINDOW]
             rms_sq = sum(s * s for s in frame) / len(frame)
             if rms_sq < 1.0:
                 continue
             pk = max(abs(s) for s in frame)
-            cf = pk / rms_sq ** 0.5
+            cf = pk / rms_sq**0.5
             if cf > max_crest:
                 max_crest = cf
         print(f'[elevenlabs] Audio quality: Peak={peak:.3f} CrestMax={max_crest:.1f}')
 
         _QUALITY_LOG.parent.mkdir(parents=True, exist_ok=True)
-        entry = _json_mod.dumps({
-            'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'voice': voice_id, 'model': model, 'lang': language or 'auto',
-            'peak': round(peak, 3), 'crest_max': round(max_crest, 1),
-            'bytes': len(opus_bytes),
-        })
+        entry = _json_mod.dumps(
+            {
+                'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'voice': voice_id,
+                'model': model,
+                'lang': language or 'auto',
+                'peak': round(peak, 3),
+                'crest_max': round(max_crest, 1),
+                'bytes': len(opus_bytes),
+            }
+        )
         lines = []
         if _QUALITY_LOG.exists():
             lines = _QUALITY_LOG.read_text(encoding='utf-8').strip().splitlines()
@@ -197,13 +225,22 @@ def send_voice_message(config):
         payload['language_code'] = language
     if use_dict:
         payload['pronunciation_dictionary_locators'] = [
-            {'pronunciation_dictionary_id': PRONUNCIATION_DICT_ID, 'version_id': PRONUNCIATION_DICT_VERSION}
+            {
+                'pronunciation_dictionary_id': PRONUNCIATION_DICT_ID,
+                'version_id': PRONUNCIATION_DICT_VERSION,
+            }
         ]
 
-    print(f'[elevenlabs] Generating speech ({len(text)} chars, model={model}, voice={voice_id}, lang={language or "auto"}, stability={stability}, speed={speed})')
+    print(
+        f'[elevenlabs] Generating speech ({len(text)} chars, model={model}, voice={voice_id}, lang={language or "auto"}, stability={stability}, speed={speed})'
+    )
     if use_dict:
         print(f'[elevenlabs] Using pronunciation dictionary ({PRONUNCIATION_WORD})')
-    resp = requests.post(url, headers={'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json'}, json=payload)
+    resp = requests.post(
+        url,
+        headers={'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json'},
+        json=payload,
+    )
 
     if resp.status_code != 200:
         print(f'[elevenlabs] Error {resp.status_code}: {resp.text[:300]}')
