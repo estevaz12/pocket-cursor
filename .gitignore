@@ -7,6 +7,7 @@
 .bridge.lock
 .muted
 .active_chat
+.telegram_routes.json
 .context_pcts
 
 # Journals (personal to each conversation, except example)

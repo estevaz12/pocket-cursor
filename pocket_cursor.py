@@ -41,6 +41,13 @@ from PIL import Image
 from chat_detection import install_chat_listener, list_chats, start_chat_listener, ts_print
 from lib import command_rules
 from lib.observability import init_sentry
+from lib.telegram_routes import (
+    RouteKey,
+    load_routes_json,
+    migrate_legacy_route_files,
+    route_key_from_message,
+    save_routes_json,
+)
 
 # Sibling modules
 from start_cursor import discover_cdp_ports
@@ -84,6 +91,8 @@ _owner_raw = os.environ.get('TELEGRAM_OWNER_ID')
 OWNER_ID: int | None = int(_owner_raw) if _owner_raw else None
 owner_file = Path(__file__).parent / '.owner_id'
 chat_id_file = Path(__file__).parent / '.chat_id'
+active_chat_file = Path(__file__).parent / '.active_chat'
+routes_file = Path(__file__).parent / '.telegram_routes.json'
 
 # Shared state
 cdp_lock = threading.Lock()
@@ -91,20 +100,35 @@ ws = None  # Active instance's WebSocket (all cdp_* functions use this)
 _browser_ws_url = None  # Browser-level WebSocket URL (cached at connect time)
 instance_registry: dict[Any, Any] = {}  # {target_id: {workspace, ws, ws_url, title}}
 active_instance_id = None  # Which instance ws points to
-mirrored_chat = None  # (instance_id, pc_id, chat_name) — the ONE chat being mirrored
+# Per Telegram route → (instance_id, pc_id, chat_name) mirrored to Cursor
+mirrored_chats: dict[RouteKey, tuple[str, str, str]] = {}
+mirrored_chats_lock = threading.Lock()
+# Last Telegram route that received a message or callback (DOM chat switch updates this route)
+last_sender_route: RouteKey | None = None
 # Load chat_id from disk so PC messages work after restart without a Telegram message first
 chat_id = int(chat_id_file.read_text().strip()) if chat_id_file.exists() else None
+# Persisted route bindings (workspace/pc_id/name) loaded at import; resolved in cdp_connect
+if routes_file.exists():
+    _route_bindings_initial: dict[RouteKey, dict[str, Any]] = load_routes_json(routes_file)
+else:
+    _route_bindings_initial = migrate_legacy_route_files(chat_id_file, active_chat_file)
+    if _route_bindings_initial:
+        try:
+            save_routes_json(routes_file, _route_bindings_initial)
+        except OSError:
+            pass
 chat_id_lock = threading.Lock()
 muted_file = Path(__file__).parent / '.muted'
 muted = muted_file.exists()  # Persisted across restarts
-active_chat_file = Path(__file__).parent / '.active_chat'
 context_pcts_file = Path(__file__).parent / '.context_pcts'
 phone_outbox = Path(__file__).parent / '_phone_outbox'
 # Note: no reinit_monitor — monitor tracks continuously even while muted,
 # just skips Telegram sends. This keeps forwarded_ids in sync at all times.
-last_sent_text = None  # Last message sent by the sender thread
+# Per Telegram route (chat + optional forum topic): last outbound text / message id
+last_sent_by_route: dict[RouteKey, str] = {}
+last_tg_message_id_by_route: dict[RouteKey, int] = {}
 last_sent_lock = threading.Lock()
-last_tg_message_id = None  # Message ID of the last Telegram message (for reactions)
+last_tg_message_id = None  # legacy: last route’s message id (reactions)
 pending_confirms: dict[Any, Any] = {}  # {short_cb_key: {...}} for inline keyboards
 pending_confirms_lock = threading.Lock()
 
@@ -115,19 +139,40 @@ def _confirm_callback_key(tool_id: str) -> str:
     return h
 
 
-def _save_active_chat(workspace, chat_name, pc_id):
-    """Persist active chat state."""
+def _primary_route() -> RouteKey | None:
+    """Default DM route for this bridge (no forum topic)."""
+    if chat_id is None:
+        return None
+    return RouteKey(chat_id, None)
+
+
+def _mirror_for_inbound(route: RouteKey) -> tuple[str, str, str] | None:
+    """Resolve Cursor mirror for a Telegram route; seed forum topic from primary DM route."""
+    with mirrored_chats_lock:
+        if route in mirrored_chats:
+            return mirrored_chats[route]
+        primary = RouteKey(route.chat_id, None)
+        if primary in mirrored_chats:
+            mirrored_chats[route] = mirrored_chats[primary]
+            _persist_mirrored_routes()
+            return mirrored_chats[route]
+    return None
+
+
+def _persist_mirrored_routes() -> None:
+    """Persist mirrored_chats to `.telegram_routes.json`."""
     try:
-        active_chat_file.write_text(
-            json.dumps(
-                {
-                    'workspace': workspace,
-                    'chat_name': chat_name,
+        bind: dict[RouteKey, dict[str, Any]] = {}
+        with mirrored_chats_lock:
+            for rk, (iid, pc_id, name) in mirrored_chats.items():
+                info = instance_registry.get(iid, {})
+                bind[rk] = {
+                    'workspace': info.get('workspace'),
                     'pc_id': pc_id,
+                    'chat_name': name,
                 }
-            )
-        )
-    except Exception:
+        save_routes_json(routes_file, bind)
+    except OSError:
         pass
 
 
@@ -144,16 +189,22 @@ def tg_call(method, **params):
     return result
 
 
-def tg_typing(cid):
+def tg_typing(cid, message_thread_id=None):
     """Show 'typing...' indicator."""
-    return tg_call('sendChatAction', chat_id=cid, action='typing')
+    params: dict[str, Any] = {'chat_id': cid, 'action': 'typing'}
+    if message_thread_id is not None:
+        params['message_thread_id'] = message_thread_id
+    return tg_call('sendChatAction', **params)
 
 
-def tg_send(cid, text):
+def tg_send(cid, text, message_thread_id=None):
     if not cid:
         return
+    base: dict[str, Any] = {'chat_id': cid}
+    if message_thread_id is not None:
+        base['message_thread_id'] = message_thread_id
     if len(text) <= 4000:
-        return tg_call('sendMessage', chat_id=cid, text=text)
+        return tg_call('sendMessage', text=text, **base)
     # Split long messages at line breaks
     chunks = []
     while len(text) > 4000:
@@ -165,7 +216,7 @@ def tg_send(cid, text):
     if text:
         chunks.append(text)
     for chunk in chunks:
-        tg_call('sendMessage', chat_id=cid, text=chunk)
+        tg_call('sendMessage', text=chunk, **base)
         time.sleep(0.3)
 
 
@@ -175,12 +226,15 @@ def tg_escape_markdown_v2(text):
     return ''.join('\\' + ch if ch in special else ch for ch in text)
 
 
-def tg_send_thinking(cid, text):
+def tg_send_thinking(cid, text, message_thread_id=None):
     """Send thinking text to Telegram in italic with 💭 prefix.
     Tries MarkdownV2 italic first, falls back to plain text if formatting fails.
     """
     if not cid or not text:
         return
+    base: dict[str, Any] = {'chat_id': cid}
+    if message_thread_id is not None:
+        base['message_thread_id'] = message_thread_id
     # Truncate if very long (thinking can be verbose)
     if len(text) > 3500:
         cut = text[:3500].rfind('\n')
@@ -191,7 +245,7 @@ def tg_send_thinking(cid, text):
     try:
         escaped = tg_escape_markdown_v2(text)
         msg = f'_💭 {escaped}_'
-        result = tg_call('sendMessage', chat_id=cid, text=msg, parse_mode='MarkdownV2')
+        result = tg_call('sendMessage', text=msg, parse_mode='MarkdownV2', **base)
         if result.get('ok'):
             return result
         print(
@@ -200,16 +254,18 @@ def tg_send_thinking(cid, text):
     except Exception as e:
         print(f'[telegram] MarkdownV2 error: {e}, falling back to plain text')
     # Fallback: plain text with prefix
-    return tg_call('sendMessage', chat_id=cid, text=f'💭 {text}')
+    return tg_call('sendMessage', text=f'💭 {text}', **base)
 
 
-def tg_send_photo(cid, photo_path, caption=None):
+def tg_send_photo(cid, photo_path, caption=None, message_thread_id=None):
     """Send a photo to Telegram. photo_path is a local file path."""
     if not cid or not photo_path:
         return
     try:
         with open(photo_path, 'rb') as f:
-            data = {'chat_id': cid}
+            data: dict[str, Any] = {'chat_id': cid}
+            if message_thread_id is not None:
+                data['message_thread_id'] = message_thread_id
             if caption:
                 data['caption'] = caption[:1024]  # Telegram caption limit
             resp = requests.post(f'{TG_API}/sendPhoto', data=data, files={'photo': f}, timeout=30)
@@ -224,12 +280,16 @@ def tg_send_photo(cid, photo_path, caption=None):
         return None
 
 
-def tg_send_photo_bytes(cid, photo_bytes, filename='screenshot.png', caption=None):
+def tg_send_photo_bytes(
+    cid, photo_bytes, filename='screenshot.png', caption=None, message_thread_id=None
+):
     """Send photo from bytes (e.g. CDP screenshot)."""
     if not cid or not photo_bytes:
         return
     try:
-        data = {'chat_id': cid}
+        data: dict[str, Any] = {'chat_id': cid}
+        if message_thread_id is not None:
+            data['message_thread_id'] = message_thread_id
         if caption:
             data['caption'] = caption[:1024]
         resp = requests.post(
@@ -250,13 +310,15 @@ def tg_send_photo_bytes(cid, photo_bytes, filename='screenshot.png', caption=Non
 
 
 def tg_send_photo_bytes_with_keyboard(
-    cid, photo_bytes, keyboard, filename='screenshot.png', caption=None
+    cid, photo_bytes, keyboard, filename='screenshot.png', caption=None, message_thread_id=None
 ):
     """Send photo with inline keyboard buttons."""
     if not cid or not photo_bytes:
         return None
     try:
-        data = {'chat_id': cid}
+        data: dict[str, Any] = {'chat_id': cid}
+        if message_thread_id is not None:
+            data['message_thread_id'] = message_thread_id
         if caption:
             data['caption'] = caption[:1024]
         data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
@@ -465,17 +527,32 @@ _last_chat_activated_mono = 0.0
 _CHAT_ACTIVATED_COOLDOWN_S = 25.0
 
 
+def _tg_notify_all_routes(text: str) -> None:
+    """Send a system line to every Telegram route (forum topics each get a copy)."""
+    if muted:
+        return
+    with mirrored_chats_lock:
+        rks = list(mirrored_chats.keys())
+    if not rks:
+        if chat_id:
+            tg_send(chat_id, text)
+        return
+    for rk in rks:
+        tg_send(rk.chat_id, text, message_thread_id=rk.message_thread_id)
+
+
 def _send_chat_activated_telegram(text: str) -> None:
     """At most one 'Chat activated' every COOLDOWN seconds (any text) — DOM listeners can race."""
     global _last_chat_activated_mono
-    if not chat_id or muted:
+    r = last_sender_route or _primary_route()
+    if not r or muted:
         return
     now = time.monotonic()
     if now - _last_chat_activated_mono < _CHAT_ACTIVATED_COOLDOWN_S:
         return
     _last_chat_activated_mono = now
     try:
-        tg_send(chat_id, text)
+        tg_send(r.chat_id, text, message_thread_id=r.message_thread_id)
     except Exception:
         pass
 
@@ -487,19 +564,24 @@ def _handle_chat_switch(iid, data):
     that happen when Cursor moves a chat between sidebar and editor views.
     If the focus returns to the original chat (A->B->A), no notification is sent.
     """
-    global mirrored_chat, active_instance_id, ws
+    global mirrored_chats, active_instance_id, ws
     global _switch_debounce_timer, _switch_debounce_pre_pcid
     pc_id = data.get('pc_id', '')
     name = data.get('name', '')
     if not pc_id:
         return
     with _switch_lock:
-        cur_iid = mirrored_chat[0] if mirrored_chat else None
-        cur_pc_id = mirrored_chat[1] if mirrored_chat else None
+        rk = last_sender_route
+        if rk is None and chat_id is not None:
+            rk = RouteKey(chat_id, None)
+        cur_mc = mirrored_chats.get(rk) if rk else None
+        cur_iid = cur_mc[0] if cur_mc else None
+        cur_pc_id = cur_mc[1] if cur_mc else None
         if iid == cur_iid and pc_id == cur_pc_id:
             return
         same_chat_new_window = pc_id == cur_pc_id and iid != cur_iid
-        mirrored_chat = (iid, pc_id, name)
+        if rk is not None:
+            mirrored_chats[rk] = (iid, pc_id, name)
     if iid != active_instance_id:
         with cdp_lock:
             active_instance_id = iid
@@ -534,7 +616,7 @@ def _handle_chat_switch(iid, data):
 
             _switch_debounce_timer = threading.Timer(1.5, _fire)
             _switch_debounce_timer.start()
-    _save_active_chat(info.get('workspace'), name, pc_id)
+    _persist_mirrored_routes()
     if CONTEXT_MONITOR:
         try:
             cursor_clear_input()
@@ -544,15 +626,16 @@ def _handle_chat_switch(iid, data):
 
 def _handle_chat_rename(iid, data):
     """Called by chat listener thread when active chat's name changes."""
-    global mirrored_chat
+    global mirrored_chats
     pc_id = data.get('pc_id', '')
     name = data.get('name', '')
     if not pc_id or not name:
         return
-    if mirrored_chat and mirrored_chat[0] == iid and mirrored_chat[1] == pc_id:
-        mirrored_chat = (iid, pc_id, name)
-        info = instance_registry.get(iid, {})
-        _save_active_chat(info.get('workspace'), name, pc_id)
+    with mirrored_chats_lock:
+        for rk, mc in list(mirrored_chats.items()):
+            if mc[0] == iid and mc[1] == pc_id:
+                mirrored_chats[rk] = (iid, pc_id, name)
+    _persist_mirrored_routes()
     if CONTEXT_MONITOR and pc_id in _context_pct_names:
         _context_pct_names[pc_id] = name
         _save_context_pcts(pc_id=pc_id, chat_name=name)
@@ -625,8 +708,8 @@ def _build_context_annotation(ctx, pc_id):
 
 
 def cdp_connect():
-    """Connect to all Cursor instances. Restores the last active chat from .active_chat, or defaults to the first instance with a workspace."""
-    global ws, instance_registry, active_instance_id, mirrored_chat, _browser_ws_url
+    """Connect to all Cursor instances. Restores per-route mirrors from `.telegram_routes.json` (or legacy `.active_chat`), or defaults."""
+    global ws, instance_registry, active_instance_id, mirrored_chats, _browser_ws_url
     port = detect_cdp_port()
     print(f'[cdp] Using port {port}')
     try:
@@ -680,28 +763,33 @@ def cdp_connect():
             except Exception:
                 pass
 
-    # Set active instance: (1) persisted state, (2) first with workspace
+    # Restore per-route mirrors from persisted bindings; first match sets active window
     active_instance_id = None
-    mirrored_chat = None
-
-    if active_chat_file.exists():
-        try:
-            saved = json.loads(active_chat_file.read_text())
-            saved_ws = saved.get('workspace')
-            saved_pc_id = saved.get('pc_id')
-            saved_name = saved.get('chat_name')
-            for wid, info in instance_registry.items():
-                if info['workspace'] == saved_ws:
-                    for pc_id, conv in info.get('convs', {}).items():
-                        if pc_id == saved_pc_id or conv['name'] == saved_name:
-                            active_instance_id = wid
-                            mirrored_chat = (wid, pc_id, conv['name'])
-                            print(f'[cdp] Active (restored): {info["workspace"]} -- {conv["name"]}')
-                            break
-                if active_instance_id:
+    mirrored_chats.clear()
+    for rk, binding in _route_bindings_initial.items():
+        saved_ws = binding.get('workspace')
+        saved_pc_id = binding.get('pc_id')
+        saved_name = binding.get('chat_name')
+        if not saved_pc_id and not saved_name:
+            continue
+        for wid, info in instance_registry.items():
+            if saved_ws and info['workspace'] != saved_ws:
+                continue
+            for pc_id, conv in info.get('convs', {}).items():
+                if pc_id == saved_pc_id or conv['name'] == saved_name:
+                    mirrored_chats[rk] = (wid, pc_id, conv['name'])
+                    if active_instance_id is None:
+                        active_instance_id = wid
+                        print(
+                            f'[cdp] Active (restored): {info["workspace"]} -- {conv["name"]}  [{rk.to_storage_key()}]'
+                        )
+                    else:
+                        print(
+                            f'[cdp] Route restored: {rk.to_storage_key()} -> {conv["name"]}  ({info["workspace"]})'
+                        )
                     break
-        except Exception:
-            pass
+            if rk in mirrored_chats:
+                break
 
     if not active_instance_id:
         active_instance_id = next(
@@ -1357,17 +1445,110 @@ def cursor_clear_input(conn=None):
         json.loads(c.recv())
 
 
-def cursor_send_message(text, raw=False):
+def cdp_activate_agent_tab(conn, resolved_pc_id: str, resolved_name: str) -> str:
+    """Activate the agent/composer tab for the given pc_id (same logic as /chats callback)."""
+    return cdp_eval_on(
+        conn,
+        f"""
+        (function() {{
+            const targetPcId = {json.dumps(resolved_pc_id)};
+            const nameHint = {json.dumps(resolved_name)};
+            function normChatTitle(s) {{
+                return (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            }}
+            function unifiedCellTitle(cell) {{
+                const te = cell.querySelector('.agent-sidebar-cell-text')
+                    || cell.querySelector('[class*="sidebar-cell-text"]')
+                    || cell.querySelector('[class*="cell-text"]');
+                if (te) return te.textContent.trim();
+                const al = cell.getAttribute('aria-label');
+                if (al) return al.trim();
+                return (cell.textContent || '').replace(/\\s+/g, ' ').trim();
+            }}
+            const candidates = Array.from(document.querySelectorAll('[data-pc-id]')).filter(
+                function(n) {{ return n.getAttribute('data-pc-id') === targetPcId; }});
+            let el = null;
+            for (const c of candidates) {{
+                if (c.querySelector('a[aria-id="chat-horizontal-tab"]')) {{ el = c; break; }}
+                if (c.querySelector('.composer-tab-label')) {{ el = c; break; }}
+                if (c.classList && c.classList.contains('agent-sidebar-cell')) {{ el = c; break; }}
+            }}
+            if (!el && nameHint) {{
+                const w = normChatTitle(nameHint);
+                for (const cell of document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell')) {{
+                    if (cell.getAttribute('data-selected') === null) continue;
+                    const g = normChatTitle(unifiedCellTitle(cell));
+                    if (g && g === w) {{ el = cell; break; }}
+                }}
+                if (!el && w.length >= 3) {{
+                    for (const cell of document.querySelectorAll('.unified-agents-sidebar .agent-sidebar-cell')) {{
+                        if (cell.getAttribute('data-selected') === null) continue;
+                        const g = normChatTitle(unifiedCellTitle(cell));
+                        if (g && (g.indexOf(w) >= 0 || w.indexOf(g) >= 0)) {{ el = cell; break; }}
+                    }}
+                }}
+            }}
+            if (!el && nameHint) {{
+                const w = normChatTitle(nameHint);
+                for (const a of document.querySelectorAll('[class*="agent-tabs"] li a[aria-id="chat-horizontal-tab"]')) {{
+                    const lab = a.getAttribute('aria-label') || a.textContent.trim();
+                    const g = normChatTitle(lab);
+                    if (g === w) {{ el = a.closest('li'); break; }}
+                }}
+            }}
+            if (!el) return 'ERROR: tab not found (pc_id=' + targetPcId + ', name=' + (nameHint || '?') + ', checked ' + candidates.length + ' id candidates)';
+            const a = el.querySelector('a[aria-id="chat-horizontal-tab"]');
+            if (a) {{ a.click(); return a.getAttribute('aria-label') || 'OK'; }}
+            if (el.classList && el.classList.contains('agent-sidebar-cell')) {{
+                el.click();
+                const ut = unifiedCellTitle(el);
+                return ut || 'OK';
+            }}
+            el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, button: 0}}));
+            const label = el.querySelector('.label-name');
+            return label ? label.textContent.trim() || 'OK' : 'OK';
+        }})();
+    """,
+    )
+
+
+def cursor_switch_to_mirrored(mc: tuple[str, str, str] | None) -> None:
+    """Bring the Cursor window to front and activate the mirrored agent tab."""
+    global active_instance_id, ws
+    if not mc:
+        return
+    iid, pc_id, name = mc
+    info = instance_registry.get(iid)
+    if not info:
+        return
+    if iid != active_instance_id:
+        with cdp_lock:
+            active_instance_id = iid
+            ws = info['ws']
+        try:
+            cdp_bring_to_front(info['ws'], iid)
+        except Exception:
+            pass
+    cdp_activate_agent_tab(info['ws'], pc_id, name)
+
+
+def cursor_send_message(text, raw=False, mirrored=None):
     """Focus the input editor, insert text, click send.
     Holds the CDP lock for the entire sequence to avoid monitor thread contention.
     Auto-prepends [Phone] [Day YYYY-MM-DD HH:MM] unless raw=True.
+    If ``mirrored`` is (instance_id, pc_id, name), switch to that tab first (forum topic routing).
     """
     if not raw:
         timestamp = datetime.now().strftime('%a %Y-%m-%d %H:%M')
         text = f'[{timestamp}] [Phone] {text}'
 
     global msg_id_counter
-    conn = active_conn()
+    if mirrored:
+        cursor_switch_to_mirrored(mirrored)
+        iid, _, _ = mirrored
+        conn = instance_registry.get(iid, {}).get('ws') or active_conn()
+    else:
+        conn = active_conn()
     t0 = time.time()
 
     with cdp_lock:
@@ -1956,11 +2137,13 @@ def sender_thread():
     global \
         chat_id, \
         OWNER_ID, \
-        last_sent_text, \
+        last_sender_route, \
+        last_sent_by_route, \
+        last_tg_message_id_by_route, \
         last_tg_message_id, \
         muted, \
         active_instance_id, \
-        mirrored_chat
+        mirrored_chats
     print('[sender] Starting Telegram poller...')
 
     # Drain any pending updates from before this restart
@@ -2043,6 +2226,17 @@ def sender_thread():
                         # New format: chat:{instance_id}:{pc_id}
                         parts = cb_data.split(':', 2)
                         if len(parts) == 3:
+                            cb_msg = callback.get('message') or {}
+                            try:
+                                cb_route = route_key_from_message(cb_msg)
+                            except Exception:
+                                cb_route = (
+                                    RouteKey(cb_msg.get('chat', {}).get('id', 0), None)
+                                    if cb_msg.get('chat')
+                                    else _primary_route()
+                                )
+                            if cb_route is not None:
+                                last_sender_route = cb_route
                             _, target_iid, target_pc_id = parts
                             info = instance_registry.get(target_iid)
                             if not info:
@@ -2187,17 +2381,23 @@ def sender_thread():
                                         cdp_bring_to_front(info['ws'], target_iid)
                                     except Exception as e:
                                         print(f'[sender] Could not bring window to front: {e}')
-                                # Update mirrored_chat immediately (don't wait for overview thread)
+                                # Update mirror for this Telegram route immediately
                                 chat_label = (
                                     result
                                     if result and result != 'OK'
                                     else (resolved_name or resolved_pc_id)
                                 )
-                                mirrored_chat = (target_iid, resolved_pc_id, chat_label)
+                                if cb_route is not None:
+                                    with mirrored_chats_lock:
+                                        mirrored_chats[cb_route] = (
+                                            target_iid,
+                                            resolved_pc_id,
+                                            chat_label,
+                                        )
+                                    _persist_mirrored_routes()
                                 tg_call(
                                     'answerCallbackQuery', callback_query_id=cb_id, text='Switched'
                                 )
-                                _save_active_chat(info.get('workspace'), chat_label, resolved_pc_id)
                             print(f'[sender] Agent switch: {result}')
                         else:
                             # Legacy format: agent:{index}
@@ -2284,6 +2484,13 @@ def sender_thread():
                 user_id = msg['from']['id']
                 user = msg['from'].get('first_name', '?')
 
+                try:
+                    route = route_key_from_message(msg)
+                except Exception:
+                    route = RouteKey(cid, None)
+                last_sender_route = route
+                thr = route.message_thread_id
+
                 # Owner check
                 status = check_owner(user_id, cid)
 
@@ -2319,10 +2526,14 @@ def sender_thread():
                 # Handle photo messages (from phone gallery, camera, etc.)
                 if photo:
                     print(f'[sender] {user}: [photo] {caption}')
-                    tg_typing(cid)
+                    tg_typing(cid, message_thread_id=thr)
+                    _mc = _mirror_for_inbound(route)
+                    if _mc:
+                        cursor_switch_to_mirrored(_mc)
                     # Mark so monitor knows this turn came from Telegram
                     with last_sent_lock:
-                        last_sent_text = caption if caption else '[photo]'
+                        last_sent_by_route[route] = caption if caption else '[photo]'
+                        last_tg_message_id_by_route[route] = mid
                         last_tg_message_id = mid
                     # Get the largest resolution (last in the array)
                     file_id = photo[-1]['file_id']
@@ -2351,19 +2562,21 @@ def sender_thread():
                         # If there's a caption, also insert it as text
                         if caption:
                             time.sleep(0.5)
-                            cursor_send_message(caption)
+                            cursor_send_message(caption, mirrored=_mc)
                         else:
                             # Just click send after the image
                             time.sleep(0.5)
                             cursor_click_send()
                     else:
-                        tg_send(cid, 'Failed to download photo from Telegram.')
+                        tg_send(
+                            cid, 'Failed to download photo from Telegram.', message_thread_id=thr
+                        )
                     continue
 
                 # Handle voice messages
                 if voice:
                     print(f'[sender] {user}: [voice] {voice.get("duration", "?")}s')
-                    tg_typing(cid)
+                    tg_typing(cid, message_thread_id=thr)
                     file_id = voice['file_id']
                     file_info = tg_call('getFile', file_id=file_id)
                     if file_info.get('ok'):
@@ -2377,19 +2590,24 @@ def sender_thread():
                         if transcription:
                             print(f'[sender] Transcribed: {transcription[:80]}')
                             # Echo transcription back to Telegram so user sees what was understood
-                            tg_send(cid, f'🎤 {transcription}')
+                            tg_send(cid, f'🎤 {transcription}', message_thread_id=thr)
                             # Send to Cursor
                             with last_sent_lock:
-                                last_sent_text = transcription
+                                last_sent_by_route[route] = transcription
+                                last_tg_message_id_by_route[route] = mid
                                 last_tg_message_id = mid
-                            result = cursor_send_message(f'[Voice] {transcription}')
+                            result = cursor_send_message(
+                                f'[Voice] {transcription}', mirrored=_mirror_for_inbound(route)
+                            )
                             print(f'[sender] -> Cursor: {result}')
                         else:
                             tg_send(
-                                cid, 'Could not transcribe voice message. Is OPENAI_API_KEY set?'
+                                cid,
+                                'Could not transcribe voice message. Is OPENAI_API_KEY set?',
+                                message_thread_id=thr,
                             )
                     else:
-                        tg_send(cid, 'Failed to download voice message.')
+                        tg_send(cid, 'Failed to download voice message.', message_thread_id=thr)
                     continue
 
                 print(f'[sender] {user}: {text}')
@@ -2406,14 +2624,18 @@ def sender_thread():
                     if conv_name:
                         lines.append(f'💬 {conv_name}')
                     lines.append('\n/newchat /chats /pause /play /screenshot /unpair')
-                    tg_send(cid, '\n'.join(lines))
+                    tg_send(cid, '\n'.join(lines), message_thread_id=thr)
                     continue
 
                 if text == '/unpair':
                     OWNER_ID = None
                     if owner_file.exists():
                         owner_file.unlink()
-                    tg_send(cid, '👋 Unpaired. Next message from anyone will pair them.')
+                    tg_send(
+                        cid,
+                        '👋 Unpaired. Next message from anyone will pair them.',
+                        message_thread_id=thr,
+                    )
                     print('[owner] Unpaired')
                     continue
 
@@ -2421,7 +2643,9 @@ def sender_thread():
                     muted = True
                     muted_file.touch()
                     tg_send(
-                        cid, "⏸ Paused. Nothing will be forwarded.\nSend /play when you're ready."
+                        cid,
+                        "⏸ Paused. Nothing will be forwarded.\nSend /play when you're ready.",
+                        message_thread_id=thr,
                     )
                     print('[sender] Paused')
                     continue
@@ -2434,7 +2658,7 @@ def sender_thread():
                     resume_msg = '▶ Resumed.'
                     if conv_name:
                         resume_msg += f'\n💬 {conv_name}'
-                    tg_send(cid, resume_msg)
+                    tg_send(cid, resume_msg, message_thread_id=thr)
                     print('[sender] Resumed')
                     continue
 
@@ -2449,17 +2673,19 @@ def sender_thread():
                     time.sleep(0.3)
                     png = cdp_screenshot()
                     if png:
-                        tg_send_photo_bytes(cid, png, caption='Cursor IDE screenshot')
+                        tg_send_photo_bytes(
+                            cid, png, caption='Cursor IDE screenshot', message_thread_id=thr
+                        )
                         print(f'[sender] Screenshot sent ({len(png)} bytes)')
                     else:
-                        tg_send(cid, 'Failed to capture screenshot.')
+                        tg_send(cid, 'Failed to capture screenshot.', message_thread_id=thr)
                     continue
 
                 if text == '/newchat':
                     print('[sender] Creating new chat...')
                     result = cursor_new_chat()
                     if not result or not result.startswith('OK'):
-                        tg_send(cid, f'Failed: {result}')
+                        tg_send(cid, f'Failed: {result}', message_thread_id=thr)
                     print(f'[sender] New chat: {result}')
                     continue
 
@@ -2473,11 +2699,8 @@ def sender_thread():
                     for iid, info in inst_with:
                         convs = info['convs']
                         for pc_id, conv in convs.items():
-                            is_mirrored = (
-                                mirrored_chat
-                                and mirrored_chat[0] == iid
-                                and mirrored_chat[1] == pc_id
-                            )
+                            _mr = mirrored_chats.get(route)
+                            is_mirrored = _mr and _mr[0] == iid and _mr[1] == pc_id
                             star = '▶ ' if is_mirrored else ''
                             name = (
                                 conv.get('name') if isinstance(conv, dict) else None
@@ -2493,28 +2716,31 @@ def sender_thread():
                         body = f'📂 {n} chat(s) — tap to mirror'
                         if multi:
                             body += '\n[iid] = Cursor window id when multiple instances are open.'
-                        tg_call(
-                            'sendMessage',
-                            chat_id=cid,
-                            text=body[:4096],
-                            reply_markup={'inline_keyboard': keyboard_rows},
-                        )
+                        _mk: dict[str, Any] = {
+                            'chat_id': cid,
+                            'text': body[:4096],
+                            'reply_markup': {'inline_keyboard': keyboard_rows},
+                        }
+                        if thr is not None:
+                            _mk['message_thread_id'] = thr
+                        tg_call('sendMessage', **_mk)
                     else:
-                        tg_send(cid, 'No open chats right now.')
+                        tg_send(cid, 'No open chats right now.', message_thread_id=thr)
                     continue
 
                 # Record what we're sending (so monitor knows which turn is ours)
                 with last_sent_lock:
-                    last_sent_text = text
+                    last_sent_by_route[route] = text
+                    last_tg_message_id_by_route[route] = mid
                     last_tg_message_id = mid
 
                 # Send to Cursor with [Phone] prefix + timestamp (day name helps resolve relative dates)
-                tg_typing(cid)
-                result = cursor_send_message(text)
+                tg_typing(cid, message_thread_id=thr)
+                result = cursor_send_message(text, mirrored=_mirror_for_inbound(route))
                 print(f'[sender] -> Cursor: {result}')
 
                 if 'ERROR' in str(result):
-                    tg_send(cid, f'Failed: {result}')
+                    tg_send(cid, f'Failed: {result}', message_thread_id=thr)
 
         except Exception as e:
             print(f'[sender] Error: {e}')
@@ -2558,9 +2784,12 @@ def _forwarded_id_seed_from_sections(sections):
 
 
 def _reconcile_mirrored_chat_from_dom():
-    """If DOM active tab != mirrored_chat, sync (click/focus can miss very fast tab switches)."""
-    global mirrored_chat
-    mc = mirrored_chat
+    """If DOM active tab != mirror for last Telegram route, sync (fast tab switches)."""
+    global mirrored_chats
+    rk = last_sender_route or _primary_route()
+    if rk is None:
+        return False
+    mc = mirrored_chats.get(rk)
     if not mc:
         return False
     iid, pc_id, name = mc
@@ -2589,27 +2818,31 @@ def _reconcile_mirrored_chat_from_dom():
         return False
     new_name = (active.get('name') or '').strip() or name
     with _switch_lock:
-        mirrored_chat = (iid, apc, new_name)
-    _save_active_chat(info.get('workspace'), new_name, apc)
+        mirrored_chats[rk] = (iid, apc, new_name)
+    _persist_mirrored_routes()
     print(f'[monitor] Reconciled active chat from DOM: {new_name!r}')
     return True
 
 
+def _new_monitor_state() -> dict[str, Any]:
+    return {
+        'last_turn_id': None,
+        'last_conv': None,
+        'last_mc_pcid': None,
+        'last_iid': None,
+        'forwarded_ids': set(),
+        'sent_this_turn': False,
+        'prev_by_id': {},
+        'section_stable': {},
+        'initialized': False,
+        'marked_done': False,
+    }
+
+
 def monitor_thread():
-    global mirrored_chat
     print('[monitor] Starting Cursor monitor...')
-    last_turn_id = None  # Track conversation turns (DOM message id)
-    last_conv = None  # Track active conversation name (for logging)
-    mc = mirrored_chat  # Snapshot of mirrored_chat at init
-    last_mc_pcid = mc[1] if mc else None  # Track by pc_id (stable across renames)
-    last_iid = mc[0] if mc else active_instance_id
-    forwarded_ids = set()  # {section_id} — sole dedup/tracking mechanism
-    sent_this_turn = False  # Whether we've forwarded anything this turn
-    prev_by_id = {}  # {section_id: text} from previous tick (for stability)
-    section_stable = {}  # {section_id: consecutive_stable_ticks}
-    STABLE_THRESHOLD = 2  # Forward section after 2s of no change
-    initialized = False
-    marked_done = False  # Whether we've sent ✅ for this turn
+    route_states: dict[RouteKey, dict[str, Any]] = {}
+    STABLE_THRESHOLD = 2  # Forward section after N ticks of no change
 
     while True:
         try:
@@ -2621,488 +2854,578 @@ def monitor_thread():
                 continue
 
             _reconcile_mirrored_chat_from_dom()
-            # Get the last turn's info (scoped to mirrored chat's composer-id)
-            # Use mirrored_chat's instance connection — not active_conn()
-            mc = mirrored_chat
-            cp = _composer_prefix_from_pcid(mc[1]) if mc else ''
-            mc_conn = instance_registry.get(mc[0], {}).get('ws') if mc else None
-            turn = cursor_get_turn_info(cp, conn=mc_conn)
 
-            # Composer not in expected instance — search others (chat may have moved)
-            if cp and not turn['turn_id']:
-                found_iid = None
-                for iid, info in instance_registry.items():
-                    try:
-                        turn = cursor_get_turn_info(cp, conn=info['ws'])
-                        if turn['turn_id']:
-                            found_iid = iid
-                            break
-                    except Exception:
-                        pass
-
-                if not found_iid:
-                    continue
-
-                ws_label = (
-                    instance_registry[found_iid].get('workspace') or found_iid[:8]
-                ).removesuffix(' (Workspace)')
-                print(
-                    f'[monitor] Composer {cp} moved to {ws_label}, skipping {len(turn["sections"])} existing'
-                )
-                mirrored_chat = (found_iid, mc[1], mc[2])
-                last_iid = found_iid
-                last_mc_pcid = mc[1]
-                last_turn_id = turn['turn_id']
-                last_conv = turn.get('conv', '')
-                forwarded_ids = _forwarded_id_seed_from_sections(turn['sections'])
-                prev_by_id = {
-                    sec.get('id', ''): sec.get('text', '')
-                    for sec in turn['sections']
-                    if isinstance(sec, dict) and sec.get('id')
-                }
-                section_stable = {}
-                sent_this_turn = False
-                marked_done = False
+            with mirrored_chats_lock:
+                routes_list = list(mirrored_chats.items())
+            if not routes_list:
                 continue
 
-            turn_id = turn['turn_id']  # Unique DOM id per turn
-            user_full = turn['user_full']  # Full text for forwarding
-            sections = turn['sections']
-            images = turn.get('images', [])
-            conv = turn.get('conv', '')
+            for route, mc in routes_list:
+                st = route_states.setdefault(route, _new_monitor_state())
+                last_turn_id = st['last_turn_id']
+                last_conv = st['last_conv']
+                last_mc_pcid = st['last_mc_pcid']
+                last_iid = st['last_iid']
+                forwarded_ids = st['forwarded_ids']
+                sent_this_turn = st['sent_this_turn']
+                prev_by_id = st['prev_by_id']
+                section_stable = st['section_stable']
+                initialized = st['initialized']
+                marked_done = st['marked_done']
+                cid = route.chat_id
+                thr = route.message_thread_id
+                try:
+                    # Get the last turn's info (scoped to this route's mirrored chat composer-id)
+                    cp = _composer_prefix_from_pcid(mc[1]) if mc else ''
+                    mc_conn = instance_registry.get(mc[0], {}).get('ws') if mc else None
+                    turn = cursor_get_turn_info(cp, conn=mc_conn)
 
-            # Detect chat switch via mirrored_chat (set by chat_detection listener).
-            # Uses pc_id which is stable across auto-renames — unlike conv name which
-            # changes when AI renames the chat and caused false switch detections.
-            mc = mirrored_chat
-            cur_pcid = mc[1] if mc else None
-            cur_iid = mc[0] if mc else active_instance_id
-            switched = False
-            if last_mc_pcid is not None and cur_pcid and cur_pcid != last_mc_pcid:
-                switched = True
-            if last_iid is not None and cur_iid and cur_iid != last_iid:
-                switched = True
+                    # Composer not in expected instance — search others (chat may have moved)
+                    if cp and not turn['turn_id']:
+                        found_iid = None
+                        for iid, info in instance_registry.items():
+                            try:
+                                turn = cursor_get_turn_info(cp, conn=info['ws'])
+                                if turn['turn_id']:
+                                    found_iid = iid
+                                    break
+                            except Exception:
+                                pass
 
-            if switched:
-                if cur_iid != last_iid:
-                    cp = _composer_prefix_from_pcid(cur_pcid) if cur_pcid else ''
-                    sw_conn = instance_registry.get(cur_iid, {}).get('ws')
-                    turn = (
-                        cursor_get_turn_info(cp, conn=sw_conn)
-                        if sw_conn
-                        else cursor_get_turn_info(cp)
-                    )
-                    if not turn['turn_id'] and not turn['sections']:
-                        for _retry in range(8):
-                            time.sleep(0.5)
+                        if not found_iid:
+                            continue
+
+                        ws_label = (
+                            instance_registry[found_iid].get('workspace') or found_iid[:8]
+                        ).removesuffix(' (Workspace)')
+                        print(
+                            f'[monitor] Composer {cp} moved to {ws_label}, skipping {len(turn["sections"])} existing'
+                        )
+                        with mirrored_chats_lock:
+                            mirrored_chats[route] = (found_iid, mc[1], mc[2])
+                        last_iid = found_iid
+                        last_mc_pcid = mc[1]
+                        last_turn_id = turn['turn_id']
+                        last_conv = turn.get('conv', '')
+                        forwarded_ids = _forwarded_id_seed_from_sections(turn['sections'])
+                        prev_by_id = {
+                            sec.get('id', ''): sec.get('text', '')
+                            for sec in turn['sections']
+                            if isinstance(sec, dict) and sec.get('id')
+                        }
+                        section_stable = {}
+                        sent_this_turn = False
+                        marked_done = False
+                        continue
+
+                    turn_id = turn['turn_id']  # Unique DOM id per turn
+                    user_full = turn['user_full']  # Full text for forwarding
+                    sections = turn['sections']
+                    images = turn.get('images', [])
+                    conv = turn.get('conv', '')
+
+                    # Detect chat switch via mirrored tuple (chat_detection listener updates mirrored_chats).
+                    # Uses pc_id which is stable across auto-renames — unlike conv name which
+                    # changes when AI renames the chat and caused false switch detections.
+                    cur_pcid = mc[1] if mc else None
+                    cur_iid = mc[0] if mc else active_instance_id
+                    switched = False
+                    if last_mc_pcid is not None and cur_pcid and cur_pcid != last_mc_pcid:
+                        switched = True
+                    if last_iid is not None and cur_iid and cur_iid != last_iid:
+                        switched = True
+
+                    if switched:
+                        if cur_iid != last_iid:
+                            cp = _composer_prefix_from_pcid(cur_pcid) if cur_pcid else ''
+                            sw_conn = instance_registry.get(cur_iid, {}).get('ws')
                             turn = (
                                 cursor_get_turn_info(cp, conn=sw_conn)
                                 if sw_conn
                                 else cursor_get_turn_info(cp)
                             )
-                            if turn['turn_id'] or turn['sections']:
-                                break
-                    turn_id = turn['turn_id']
-                    sections = turn['sections']
-                    conv = turn.get('conv', '')
-                cur_name = mc[2] if mc else conv
-                prev_name = last_conv or f'instance {last_iid[:8] if last_iid else "?"}'
-                print(
-                    f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', skipping {len(sections)} sections"
-                )
-                forwarded_ids = _forwarded_id_seed_from_sections(sections)
-                sent_this_turn = False
-                prev_by_id = {
-                    sec.get('id', ''): sec.get('text', '')
-                    for sec in sections
-                    if isinstance(sec, dict) and sec.get('id')
-                }
-                section_stable = {}
-                marked_done = False
-                if CONTEXT_MONITOR and cur_pcid:
-                    ctx = get_context_pct(mc_conn)
-                    if ctx is not None:
-                        _context_pcts[cur_pcid] = ctx
-                        _context_pct_names[cur_pcid] = cur_name
-                        _save_context_pcts(pc_id=cur_pcid, chat_name=cur_name)
-                        print(f"[context-monitor] Switch: {ctx}% in '{cur_name}'")
-                last_turn_id = turn_id
-                last_conv = conv
-                last_mc_pcid = cur_pcid
-                last_iid = cur_iid
-                continue
-            last_conv = conv
-            last_mc_pcid = cur_pcid
-            last_iid = cur_iid
-
-            if turn_id != last_turn_id:
-                if not initialized:
-                    print(f"[monitor] Init: '{user_full[:50]}', skipping {len(sections)} existing")
-                    # Do not tg_send "Chat activated" here — _handle_chat_switch already notifies on
-                    # in-app chat switches, and duplicate monitor + DOM messages spam the user (4+ hits).
-                    if conv:
-                        mc = mirrored_chat
-                        ws_label = ''
-                        if mc:
-                            info = instance_registry.get(mc[0], {})
-                            ws_label = (info.get('workspace') or '').removesuffix(' (Workspace)')
+                            if not turn['turn_id'] and not turn['sections']:
+                                for _retry in range(8):
+                                    time.sleep(0.5)
+                                    turn = (
+                                        cursor_get_turn_info(cp, conn=sw_conn)
+                                        if sw_conn
+                                        else cursor_get_turn_info(cp)
+                                    )
+                                    if turn['turn_id'] or turn['sections']:
+                                        break
+                            turn_id = turn['turn_id']
+                            sections = turn['sections']
+                            conv = turn.get('conv', '')
+                        cur_name = mc[2] if mc else conv
+                        prev_name = last_conv or f'instance {last_iid[:8] if last_iid else "?"}'
                         print(
-                            f'[monitor] Active conv: {conv}'
-                            + (f'  ({ws_label})' if ws_label else '')
+                            f"[monitor] Switched: '{prev_name[:40]}' -> '{cur_name[:40]}', skipping {len(sections)} sections"
                         )
-                    forwarded_ids = _forwarded_id_seed_from_sections(sections)
-                    initialized = True
-                    last_turn_id = turn_id
-                    prev_by_id = {
-                        sec.get('id', ''): sec.get('text', '')
-                        for sec in sections
-                        if isinstance(sec, dict) and sec.get('id')
-                    }
-                    section_stable = {}
-                    continue
-
-                if not user_full:
-                    print(f'[monitor] user_full empty, polling (turn_id={short_id(turn_id)})...')
-                    for attempt in range(10):
-                        time.sleep(0.2)
-                        t = cursor_get_turn_info(cp)
-                        t_tid = t['turn_id']
-                        t_uf = t['user_full']
-                        if t_tid != turn_id:
-                            print(
-                                f'[monitor]   poll {attempt}: turn_id changed -> {short_id(t_tid)}, abort'
-                            )
-                            break
-                        if t_uf:
-                            print(f"[monitor]   poll {attempt}: got '{t_uf[:40]}'")
-                            user_full = t_uf
-                            sections = t['sections'] or sections
-                            images = t.get('images') or images
-                            break
-                    else:
-                        print('[monitor]   poll exhausted, user_full still empty')
-
-                # Check if this came from Telegram or was typed directly in Cursor
-                with last_sent_lock:
-                    sent = last_sent_text
-                from_telegram = sent and (sent[:30] in user_full or sent == '[photo]')
-
-                origin = 'Telegram' if from_telegram else 'Cursor'
-                print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
-                for idx, sec in enumerate(sections):
-                    if isinstance(sec, dict):
-                        print(f'  [{idx}] {sec.get("type", "?"):12s}  id={short_id(sec.get("id"))}')
-
-                if CONTEXT_MONITOR and mirrored_chat:
-                    cur_pcid = mirrored_chat[1]
-                    prev_pct = _context_pcts.get(cur_pcid)
-                    ctx = get_context_pct(mc_conn)
-                    ann = _build_context_annotation(ctx, cur_pcid)
-                    if ctx is not None:
-                        _context_pcts[cur_pcid] = ctx
-                        chat_label = mirrored_chat[2] if mirrored_chat else cur_pcid
-                        _context_pct_names[cur_pcid] = chat_label
-                        _save_context_pcts(pc_id=cur_pcid, chat_name=chat_label)
-                        lines = [f"[context-monitor] {ctx}% used in '{chat_label}'"]
-                        for pid, pct in _context_pcts.items():
-                            name = _context_pct_names.get(pid, pid)
-                            if pid == cur_pcid:
-                                delta = ctx - prev_pct if prev_pct is not None else 0
-                                trend = ' 📈' if delta > 0 else ' 📉' if delta < 0 else ''
-                                lines.append(f'  {name}: {pct:.1f}%{trend}')
-                            else:
-                                lines.append(f'  {name}: {pct:.1f}%')
-                        print('\n'.join(lines))
-                    if ann:
-                        try:
-                            cursor_prefill_input(ann, conn=mc_conn)
-                            print(f'[context-monitor] Prefilled: {ann}')
-                        except Exception as e:
-                            print(f'[context-monitor] Failed to prefill: {e}')
-
-                if not from_telegram:
-                    if not muted and user_full:
-                        tg_send(cid, f'[PC] {user_full}')
-
-                        for img_url in images:
-                            local_path = vscode_url_to_path(img_url)
-                            if local_path and Path(local_path).exists():
-                                print(f'[monitor] Forwarding image: {Path(local_path).name}')
-                                tg_send_photo(cid, local_path, caption='[PC] attached image')
-
-                forwarded_ids = set()
-                sent_this_turn = False
-                prev_by_id = {}
-                section_stable = {}
-                marked_done = False
-                last_turn_id = turn_id
-                continue
-
-            if not initialized:
-                continue
-
-            # Keep typing indicator alive while AI is generating
-            is_generating = cdp_eval("""
-                (function() { return !!document.querySelector('[data-stop-button="true"]'); })();
-            """)
-            if is_generating and not muted:
-                tg_typing(cid)
-
-            # Log newly appeared bubbles (compare against previous tick)
-            for i, sec in enumerate(sections):
-                if isinstance(sec, dict) and sec.get('id'):
-                    sid = sec['id']
-                    if sid not in prev_by_id and sid not in forwarded_ids:
-                        print(
-                            f'[monitor] + New bubble [{i}] {sec.get("type", "?"):12s}  id={short_id(sid)}'
-                        )
-
-            # [SILENT] scan: if ANY section contains [SILENT], suppress entire response
-            turn_silent = any(
-                '[SILENT]' in (s['text'] if isinstance(s, dict) else s) for s in sections
-            )
-            if turn_silent and not getattr(monitor_thread, '_silent_logged', False):
-                print('[monitor] [SILENT] detected — suppressing entire response')
-                for s in sections:
-                    sk = s.get('id', '') if isinstance(s, dict) else ''
-                    if sk:
-                        forwarded_ids.add(sk)
-                sent_this_turn = True
-                monitor_thread._silent_logged = True
-            if not turn_silent:
-                monitor_thread._silent_logged = False
-
-            # Walk sections in DOM order. Skip already-forwarded IDs.
-            # Stop at the first un-forwarded section that isn't stable yet
-            # (preserves sequential ordering for Telegram).
-            for i, sec in enumerate(sections):
-                sec_key = sec.get('id', '') if isinstance(sec, dict) else ''
-                text = sec['text'] if isinstance(sec, dict) else sec
-                sec_type = sec.get('type', 'text') if isinstance(sec, dict) else 'text'
-                sec_id = sec.get('id') if isinstance(sec, dict) else None
-
-                # Already forwarded — skip
-                if sec_key and sec_key in forwarded_ids:
-                    continue
-
-                # Check stability (keyed by ID — survives position shifts)
-                prev_text = prev_by_id.get(sec_key)
-                if text == prev_text:
-                    section_stable[sec_key] = section_stable.get(sec_key, 0) + 1
-                else:
-                    section_stable[sec_key] = 0
-
-                # Not stable yet — stop here (sequential ordering)
-                if section_stable.get(sec_key, 0) < STABLE_THRESHOLD:
-                    break
-
-                # Don't forward empty thinking — wait for content to load
-                if sec_type == 'thinking' and not text.strip():
-                    break
-
-                sec_selector = sec.get('selector') if isinstance(sec, dict) else None
-
-                if sec_type == 'confirmation':
-                    # Always track confirmation selectors; send keyboard only when not muted
-                    tool_id = sec_id
-                    cb_key = _confirm_callback_key(str(tool_id))
-                    with pending_confirms_lock:
-                        if cb_key in pending_confirms:
-                            # Already tracked this confirmation
-                            if sec_key:
-                                forwarded_ids.add(sec_key)
-                            section_stable.pop(sec_key, None)
-                            continue
-                    buttons = sec.get('buttons', [])
-                    btns_selector = sec.get('buttons_selector', '')
-                    with pending_confirms_lock:
-                        pending_confirms[cb_key] = {
-                            'buttons_selector': btns_selector,
-                            'buttons': buttons,
-                            'instance_id': mc[0] if mc else None,
+                        forwarded_ids = _forwarded_id_seed_from_sections(sections)
+                        sent_this_turn = False
+                        prev_by_id = {
+                            sec.get('id', ''): sec.get('text', '')
+                            for sec in sections
+                            if isinstance(sec, dict) and sec.get('id')
                         }
+                        section_stable = {}
+                        marked_done = False
+                        if CONTEXT_MONITOR and cur_pcid:
+                            ctx = get_context_pct(mc_conn)
+                            if ctx is not None:
+                                _context_pcts[cur_pcid] = ctx
+                                _context_pct_names[cur_pcid] = cur_name
+                                _save_context_pcts(pc_id=cur_pcid, chat_name=cur_name)
+                                print(f"[context-monitor] Switch: {ctx}% in '{cur_name}'")
+                        last_turn_id = turn_id
+                        last_conv = conv
+                        last_mc_pcid = cur_pcid
+                        last_iid = cur_iid
+                        continue
+                    last_conv = conv
+                    last_mc_pcid = cur_pcid
+                    last_iid = cur_iid
 
-                    # Auto-accept: check command text against allow/deny rules
-                    rule_result = command_rules.match(text) if COMMAND_RULES else None
-                    if rule_result == 'accept' and btns_selector:
-                        accept_idx, accept_label = command_rules.find_accept_button(buttons)
-                        if accept_idx is not None:
-                            # Screenshot BEFORE click (click changes DOM)
-                            png = cdp_screenshot_element(sec_selector) if sec_selector else None
-                            _accept_js = f"""
-                                (function() {{
-                                    const btns = document.querySelectorAll('{btns_selector}');
-                                    if (!btns[{accept_idx}]) return 'ERROR: button not found';
-                                    btns[{accept_idx}].click();
-                                    return 'OK';
-                                }})();
-                            """
-                            click_result = (
-                                cdp_eval_on(mc_conn, _accept_js)
-                                if mc_conn
-                                else cdp_eval(_accept_js)
+                    if turn_id != last_turn_id:
+                        if not initialized:
+                            print(
+                                f"[monitor] Init: '{user_full[:50]}', skipping {len(sections)} existing"
                             )
-                            if click_result and str(click_result).strip() == 'OK':
-                                print(f'[command-rules] Auto-accepted: {text} -> {accept_label}')
-                                if not muted and cid:
-                                    if png:
-                                        tg_send_photo_bytes(
+                            # Do not tg_send "Chat activated" here — _handle_chat_switch already notifies on
+                            # in-app chat switches, and duplicate monitor + DOM messages spam the user (4+ hits).
+                            if conv:
+                                ws_label = ''
+                                if mc:
+                                    info = instance_registry.get(mc[0], {})
+                                    ws_label = (info.get('workspace') or '').removesuffix(
+                                        ' (Workspace)'
+                                    )
+                                print(
+                                    f'[monitor] Active conv: {conv}'
+                                    + (f'  ({ws_label})' if ws_label else '')
+                                )
+                            forwarded_ids = _forwarded_id_seed_from_sections(sections)
+                            initialized = True
+                            last_turn_id = turn_id
+                            prev_by_id = {
+                                sec.get('id', ''): sec.get('text', '')
+                                for sec in sections
+                                if isinstance(sec, dict) and sec.get('id')
+                            }
+                            section_stable = {}
+                            continue
+
+                        if not user_full:
+                            print(
+                                f'[monitor] user_full empty, polling (turn_id={short_id(turn_id)})...'
+                            )
+                            for attempt in range(10):
+                                time.sleep(0.2)
+                                t = cursor_get_turn_info(cp, conn=mc_conn)
+                                t_tid = t['turn_id']
+                                t_uf = t['user_full']
+                                if t_tid != turn_id:
+                                    print(
+                                        f'[monitor]   poll {attempt}: turn_id changed -> {short_id(t_tid)}, abort'
+                                    )
+                                    break
+                                if t_uf:
+                                    print(f"[monitor]   poll {attempt}: got '{t_uf[:40]}'")
+                                    user_full = t_uf
+                                    sections = t['sections'] or sections
+                                    images = t.get('images') or images
+                                    break
+                            else:
+                                print('[monitor]   poll exhausted, user_full still empty')
+
+                        # Check if this came from Telegram or was typed directly in Cursor
+                        with last_sent_lock:
+                            sent = last_sent_by_route.get(route)
+                        from_telegram = sent and (sent[:30] in user_full or sent == '[photo]')
+
+                        origin = 'Telegram' if from_telegram else 'Cursor'
+                        print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
+                        for idx, sec in enumerate(sections):
+                            if isinstance(sec, dict):
+                                print(
+                                    f'  [{idx}] {sec.get("type", "?"):12s}  id={short_id(sec.get("id"))}'
+                                )
+
+                        if CONTEXT_MONITOR and mc:
+                            cur_pcid = mc[1]
+                            prev_pct = _context_pcts.get(cur_pcid)
+                            ctx = get_context_pct(mc_conn)
+                            ann = _build_context_annotation(ctx, cur_pcid)
+                            if ctx is not None:
+                                _context_pcts[cur_pcid] = ctx
+                                chat_label = mc[2] if mc else cur_pcid
+                                _context_pct_names[cur_pcid] = chat_label
+                                _save_context_pcts(pc_id=cur_pcid, chat_name=chat_label)
+                                lines = [f"[context-monitor] {ctx}% used in '{chat_label}'"]
+                                for pid, pct in _context_pcts.items():
+                                    name = _context_pct_names.get(pid, pid)
+                                    if pid == cur_pcid:
+                                        delta = ctx - prev_pct if prev_pct is not None else 0
+                                        trend = ' 📈' if delta > 0 else ' 📉' if delta < 0 else ''
+                                        lines.append(f'  {name}: {pct:.1f}%{trend}')
+                                    else:
+                                        lines.append(f'  {name}: {pct:.1f}%')
+                                print('\n'.join(lines))
+                            if ann:
+                                try:
+                                    cursor_prefill_input(ann, conn=mc_conn)
+                                    print(f'[context-monitor] Prefilled: {ann}')
+                                except Exception as e:
+                                    print(f'[context-monitor] Failed to prefill: {e}')
+
+                        if not from_telegram:
+                            if not muted and user_full:
+                                tg_send(cid, f'[PC] {user_full}', message_thread_id=thr)
+
+                                for img_url in images:
+                                    local_path = vscode_url_to_path(img_url)
+                                    if local_path and Path(local_path).exists():
+                                        print(
+                                            f'[monitor] Forwarding image: {Path(local_path).name}'
+                                        )
+                                        tg_send_photo(
                                             cid,
-                                            png,
-                                            filename='auto_accept.png',
-                                            caption=f'✅ Auto: {text}',
+                                            local_path,
+                                            caption='[PC] attached image',
+                                            message_thread_id=thr,
+                                        )
+
+                        forwarded_ids = set()
+                        sent_this_turn = False
+                        prev_by_id = {}
+                        section_stable = {}
+                        marked_done = False
+                        last_turn_id = turn_id
+                        continue
+
+                    if not initialized:
+                        continue
+
+                    # Keep typing indicator alive while AI is generating
+                    _gen_js = """
+                        (function() { return !!document.querySelector('[data-stop-button="true"]'); })();
+                    """
+                    is_generating = cdp_eval_on(mc_conn, _gen_js) if mc_conn else cdp_eval(_gen_js)
+                    if is_generating and not muted:
+                        tg_typing(cid, message_thread_id=thr)
+
+                    # Log newly appeared bubbles (compare against previous tick)
+                    for i, sec in enumerate(sections):
+                        if isinstance(sec, dict) and sec.get('id'):
+                            sid = sec['id']
+                            if sid not in prev_by_id and sid not in forwarded_ids:
+                                print(
+                                    f'[monitor] + New bubble [{i}] {sec.get("type", "?"):12s}  id={short_id(sid)}'
+                                )
+
+                    # [SILENT] scan: if ANY section contains [SILENT], suppress entire response
+                    turn_silent = any(
+                        '[SILENT]' in (s['text'] if isinstance(s, dict) else s) for s in sections
+                    )
+                    if turn_silent and not getattr(monitor_thread, '_silent_logged', False):
+                        print('[monitor] [SILENT] detected — suppressing entire response')
+                        for s in sections:
+                            sk = s.get('id', '') if isinstance(s, dict) else ''
+                            if sk:
+                                forwarded_ids.add(sk)
+                        sent_this_turn = True
+                        monitor_thread._silent_logged = True
+                    if not turn_silent:
+                        monitor_thread._silent_logged = False
+
+                    # Walk sections in DOM order. Skip already-forwarded IDs.
+                    # Stop at the first un-forwarded section that isn't stable yet
+                    # (preserves sequential ordering for Telegram).
+                    for i, sec in enumerate(sections):
+                        sec_key = sec.get('id', '') if isinstance(sec, dict) else ''
+                        text = sec['text'] if isinstance(sec, dict) else sec
+                        sec_type = sec.get('type', 'text') if isinstance(sec, dict) else 'text'
+                        sec_id = sec.get('id') if isinstance(sec, dict) else None
+
+                        # Already forwarded — skip
+                        if sec_key and sec_key in forwarded_ids:
+                            continue
+
+                        # Check stability (keyed by ID — survives position shifts)
+                        prev_text = prev_by_id.get(sec_key)
+                        if text == prev_text:
+                            section_stable[sec_key] = section_stable.get(sec_key, 0) + 1
+                        else:
+                            section_stable[sec_key] = 0
+
+                        # Not stable yet — stop here (sequential ordering)
+                        if section_stable.get(sec_key, 0) < STABLE_THRESHOLD:
+                            break
+
+                        # Don't forward empty thinking — wait for content to load
+                        if sec_type == 'thinking' and not text.strip():
+                            break
+
+                        sec_selector = sec.get('selector') if isinstance(sec, dict) else None
+
+                        if sec_type == 'confirmation':
+                            # Always track confirmation selectors; send keyboard only when not muted
+                            tool_id = sec_id
+                            cb_key = _confirm_callback_key(str(tool_id))
+                            with pending_confirms_lock:
+                                if cb_key in pending_confirms:
+                                    # Already tracked this confirmation
+                                    if sec_key:
+                                        forwarded_ids.add(sec_key)
+                                    section_stable.pop(sec_key, None)
+                                    continue
+                            buttons = sec.get('buttons', [])
+                            btns_selector = sec.get('buttons_selector', '')
+                            with pending_confirms_lock:
+                                pending_confirms[cb_key] = {
+                                    'buttons_selector': btns_selector,
+                                    'buttons': buttons,
+                                    'instance_id': mc[0] if mc else None,
+                                    'route': route,
+                                }
+
+                            # Auto-accept: check command text against allow/deny rules
+                            rule_result = command_rules.match(text) if COMMAND_RULES else None
+                            if rule_result == 'accept' and btns_selector:
+                                accept_idx, accept_label = command_rules.find_accept_button(buttons)
+                                if accept_idx is not None:
+                                    # Screenshot BEFORE click (click changes DOM)
+                                    png = (
+                                        cdp_screenshot_element(sec_selector)
+                                        if sec_selector
+                                        else None
+                                    )
+                                    _accept_js = f"""
+                                        (function() {{
+                                            const btns = document.querySelectorAll('{btns_selector}');
+                                            if (!btns[{accept_idx}]) return 'ERROR: button not found';
+                                            btns[{accept_idx}].click();
+                                            return 'OK';
+                                        }})();
+                                    """
+                                    click_result = (
+                                        cdp_eval_on(mc_conn, _accept_js)
+                                        if mc_conn
+                                        else cdp_eval(_accept_js)
+                                    )
+                                    if click_result and str(click_result).strip() == 'OK':
+                                        print(
+                                            f'[command-rules] Auto-accepted: {text} -> {accept_label}'
+                                        )
+                                        if not muted and cid:
+                                            if png:
+                                                tg_send_photo_bytes(
+                                                    cid,
+                                                    png,
+                                                    filename='auto_accept.png',
+                                                    caption=f'✅ Auto: {text}',
+                                                    message_thread_id=thr,
+                                                )
+                                            else:
+                                                tg_send(
+                                                    cid, f'✅ Auto: {text}', message_thread_id=thr
+                                                )
+                                        with pending_confirms_lock:
+                                            pending_confirms.pop(cb_key, None)
+                                        if sec_key:
+                                            forwarded_ids.add(sec_key)
+                                        section_stable.pop(sec_key, None)
+                                        continue
+                                    else:
+                                        print(
+                                            f'[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard'
+                                        )
+
+                            if not muted:
+                                tg_typing(cid, message_thread_id=thr)
+                                png = None
+                                if sec_selector:
+                                    png = cdp_screenshot_element(sec_selector)
+                                keyboard = []
+                                for btn in buttons:
+                                    cb_line = f'btn_{btn["index"]}:{cb_key}'
+                                    if len(cb_line.encode('utf-8')) > 64:
+                                        print(
+                                            f'[monitor] ERROR: callback_data too long for Telegram ({len(cb_line)}): {cb_line!r}'
+                                        )
+                                    keyboard.append(
+                                        [
+                                            {
+                                                'text': btn['label'],
+                                                'callback_data': cb_line,
+                                            }
+                                        ]
+                                    )
+                                if png:
+                                    print(
+                                        f'[monitor] Forwarding CONFIRMATION with keyboard: {text}'
+                                    )
+                                    tg_send_photo_bytes_with_keyboard(
+                                        cid,
+                                        png,
+                                        keyboard,
+                                        filename='confirmation.png',
+                                        caption=f'⚡ {text}',
+                                        message_thread_id=thr,
+                                    )
+                                else:
+                                    print(f'[monitor] Forwarding CONFIRMATION as text: {text}')
+                                    _cm: dict[str, Any] = {
+                                        'chat_id': cid,
+                                        'text': f'⚡ {text}',
+                                        'reply_markup': {'inline_keyboard': keyboard},
+                                    }
+                                    if thr is not None:
+                                        _cm['message_thread_id'] = thr
+                                    tg_call('sendMessage', **_cm)
+
+                        elif not muted:
+                            # Only send to Telegram when not muted
+                            tg_typing(cid, message_thread_id=thr)
+                            if sec_type in ('table', 'file_edit', 'code_block', 'latex'):
+                                file_path = None
+                                if sec_type == 'file_edit':
+                                    fn_sel = (
+                                        sec.get('filename_selector')
+                                        if isinstance(sec, dict)
+                                        else None
+                                    )
+                                    if fn_sel:
+                                        file_path = cdp_hover_file_path(fn_sel)
+                                        if file_path:
+                                            print(f'[monitor] File path: {file_path}')
+                                png = None
+                                expanded = False
+                                if sec_selector:
+                                    expanded = cdp_try_expand(sec_selector)
+                                    png = cdp_screenshot_element(sec_selector)
+                                    if expanded:
+                                        cdp_try_collapse(sec_selector)
+                                if not png and sec_type == 'table':
+                                    png = cdp_screenshot_element(
+                                        '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
+                                    )
+                                label = {
+                                    'table': 'TABLE',
+                                    'file_edit': 'FILE_EDIT',
+                                    'code_block': 'CODE_BLOCK',
+                                    'latex': 'LATEX',
+                                }[sec_type]
+                                if sec_type == 'file_edit':
+                                    stat = sec.get('file_stat', '') if isinstance(sec, dict) else ''
+                                    display = file_path or text
+                                    if file_path and stat:
+                                        display = f'{file_path} {stat}'
+                                    caption = f'📝 {display}'
+                                else:
+                                    caption = ''
+                                if png:
+                                    print(
+                                        f'[monitor] Forwarding section {i + 1} as {label} screenshot ({len(png)} bytes)'
+                                    )
+                                    tg_send_photo_bytes(
+                                        cid,
+                                        png,
+                                        filename=f'{sec_type}.png',
+                                        caption=caption,
+                                        message_thread_id=thr,
+                                    )
+                                else:
+                                    print(
+                                        f'[monitor] {label} screenshot failed, sending as text ({len(text)} chars)'
+                                    )
+                                    prefix = '📝 ' if sec_type == 'file_edit' else ''
+                                    display_text = (
+                                        (file_path or text) if sec_type == 'file_edit' else text
+                                    )
+                                    tg_send(cid, f'{prefix}{display_text}', message_thread_id=thr)
+                            elif sec_type == 'thinking':
+                                print(f'[monitor] Forwarding THINKING ({len(text)} chars)')
+                                tg_send_thinking(cid, text, message_thread_id=thr)
+                            else:
+                                # Check for [PHONE_OUTBOX:filename] marker
+                                outbox_match = OUTBOX_MARKER_RE.search(text)
+                                if outbox_match:
+                                    outbox_filename = outbox_match.group(1).strip()
+                                    caption = OUTBOX_MARKER_RE.sub('', text).strip()
+                                    # Wait up to 15s for the file to appear
+                                    outbox_file = phone_outbox / outbox_filename
+                                    print(f'[monitor] Outbox marker: waiting for {outbox_filename}')
+                                    deadline = time.time() + 15
+                                    while not outbox_file.exists() and time.time() < deadline:
+                                        time.sleep(1)
+                                    if outbox_file.exists():
+                                        outbox_render_and_send(
+                                            outbox_filename,
+                                            cid,
+                                            caption=caption,
+                                            message_thread_id=thr,
                                         )
                                     else:
-                                        tg_send(cid, f'✅ Auto: {text}')
-                                with pending_confirms_lock:
-                                    pending_confirms.pop(cb_key, None)
-                                if sec_key:
-                                    forwarded_ids.add(sec_key)
-                                section_stable.pop(sec_key, None)
-                                continue
-                            else:
-                                print(
-                                    f'[command-rules] Auto-accept click failed ({click_result}), falling back to keyboard'
-                                )
+                                        print(
+                                            f'[monitor] Outbox file not found after 15s: {outbox_filename}'
+                                        )
+                                        if caption:
+                                            tg_send(cid, caption, message_thread_id=thr)
+                                else:
+                                    print(
+                                        f'[monitor] Forwarding section {i + 1} ({len(text)} chars)'
+                                    )
+                                    tg_send(cid, text, message_thread_id=thr)
 
-                    if not muted:
-                        tg_typing(cid)
-                        png = None
-                        if sec_selector:
-                            png = cdp_screenshot_element(sec_selector)
-                        keyboard = []
-                        for btn in buttons:
-                            cb_line = f'btn_{btn["index"]}:{cb_key}'
-                            if len(cb_line.encode('utf-8')) > 64:
-                                print(
-                                    f'[monitor] ERROR: callback_data too long for Telegram ({len(cb_line)}): {cb_line!r}'
-                                )
-                            keyboard.append(
-                                [
-                                    {
-                                        'text': btn['label'],
-                                        'callback_data': cb_line,
-                                    }
-                                ]
-                            )
-                        if png:
-                            print(f'[monitor] Forwarding CONFIRMATION with keyboard: {text}')
-                            tg_send_photo_bytes_with_keyboard(
-                                cid,
-                                png,
-                                keyboard,
-                                filename='confirmation.png',
-                                caption=f'⚡ {text}',
-                            )
-                        else:
-                            print(f'[monitor] Forwarding CONFIRMATION as text: {text}')
-                            tg_call(
-                                'sendMessage',
-                                chat_id=cid,
-                                text=f'⚡ {text}',
-                                reply_markup={'inline_keyboard': keyboard},
-                            )
+                        # Always advance tracking — muted sections are "silently consumed"
+                        if sec_key:
+                            forwarded_ids.add(sec_key)
+                        sent_this_turn = True
+                        print(
+                            f'[monitor]   → [{i}] {sec_type:12s}  id={short_id(sec_key)}  ids={len(forwarded_ids)}'
+                        )
+                        section_stable.pop(sec_key, None)
 
-                elif not muted:
-                    # Only send to Telegram when not muted
-                    tg_typing(cid)
-                    if sec_type in ('table', 'file_edit', 'code_block', 'latex'):
-                        file_path = None
-                        if sec_type == 'file_edit':
-                            fn_sel = sec.get('filename_selector') if isinstance(sec, dict) else None
-                            if fn_sel:
-                                file_path = cdp_hover_file_path(fn_sel)
-                                if file_path:
-                                    print(f'[monitor] File path: {file_path}')
-                        png = None
-                        expanded = False
-                        if sec_selector:
-                            expanded = cdp_try_expand(sec_selector)
-                            png = cdp_screenshot_element(sec_selector)
-                            if expanded:
-                                cdp_try_collapse(sec_selector)
-                        if not png and sec_type == 'table':
-                            png = cdp_screenshot_element(
-                                '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
-                            )
-                        label = {
-                            'table': 'TABLE',
-                            'file_edit': 'FILE_EDIT',
-                            'code_block': 'CODE_BLOCK',
-                            'latex': 'LATEX',
-                        }[sec_type]
-                        if sec_type == 'file_edit':
-                            stat = sec.get('file_stat', '') if isinstance(sec, dict) else ''
-                            display = file_path or text
-                            if file_path and stat:
-                                display = f'{file_path} {stat}'
-                            caption = f'📝 {display}'
-                        else:
-                            caption = ''
-                        if png:
-                            print(
-                                f'[monitor] Forwarding section {i + 1} as {label} screenshot ({len(png)} bytes)'
-                            )
-                            tg_send_photo_bytes(
-                                cid, png, filename=f'{sec_type}.png', caption=caption
-                            )
-                        else:
-                            print(
-                                f'[monitor] {label} screenshot failed, sending as text ({len(text)} chars)'
-                            )
-                            prefix = '📝 ' if sec_type == 'file_edit' else ''
-                            display_text = (file_path or text) if sec_type == 'file_edit' else text
-                            tg_send(cid, f'{prefix}{display_text}')
-                    elif sec_type == 'thinking':
-                        print(f'[monitor] Forwarding THINKING ({len(text)} chars)')
-                        tg_send_thinking(cid, text)
-                    else:
-                        # Check for [PHONE_OUTBOX:filename] marker
-                        outbox_match = OUTBOX_MARKER_RE.search(text)
-                        if outbox_match:
-                            outbox_filename = outbox_match.group(1).strip()
-                            caption = OUTBOX_MARKER_RE.sub('', text).strip()
-                            # Wait up to 15s for the file to appear
-                            outbox_file = phone_outbox / outbox_filename
-                            print(f'[monitor] Outbox marker: waiting for {outbox_filename}')
-                            deadline = time.time() + 15
-                            while not outbox_file.exists() and time.time() < deadline:
-                                time.sleep(1)
-                            if outbox_file.exists():
-                                outbox_render_and_send(outbox_filename, cid, caption=caption)
-                            else:
-                                print(
-                                    f'[monitor] Outbox file not found after 15s: {outbox_filename}'
-                                )
-                                if caption:
-                                    tg_send(cid, caption)
-                        else:
-                            print(f'[monitor] Forwarding section {i + 1} ({len(text)} chars)')
-                            tg_send(cid, text)
+                    # Build prev_by_id for next tick's stability comparison
+                    prev_by_id = {}
+                    for sec in sections:
+                        if isinstance(sec, dict) and sec.get('id'):
+                            prev_by_id[sec['id']] = sec.get('text', '')
 
-                # Always advance tracking — muted sections are "silently consumed"
-                if sec_key:
-                    forwarded_ids.add(sec_key)
-                sent_this_turn = True
-                print(
-                    f'[monitor]   → [{i}] {sec_type:12s}  id={short_id(sec_key)}  ids={len(forwarded_ids)}'
-                )
-                section_stable.pop(sec_key, None)
+                    # Mark turn as done when AI finishes (for tracking)
+                    if sent_this_turn and not marked_done:
+                        _done_js = """
+                            (function() { return !!document.querySelector('[data-stop-button="true"]'); })();
+                        """
+                        is_gen = cdp_eval_on(mc_conn, _done_js) if mc_conn else cdp_eval(_done_js)
+                        if not is_gen:
+                            print(f'[monitor] AI done — {len(forwarded_ids)} sections forwarded')
+                            marked_done = True
 
-            # Build prev_by_id for next tick's stability comparison
-            prev_by_id = {}
-            for sec in sections:
-                if isinstance(sec, dict) and sec.get('id'):
-                    prev_by_id[sec['id']] = sec.get('text', '')
+                finally:
+                    st['last_turn_id'] = last_turn_id
+                    st['last_conv'] = last_conv
+                    st['last_mc_pcid'] = last_mc_pcid
+                    st['last_iid'] = last_iid
+                    st['forwarded_ids'] = forwarded_ids
+                    st['sent_this_turn'] = sent_this_turn
+                    st['prev_by_id'] = prev_by_id
+                    st['section_stable'] = section_stable
+                    st['initialized'] = initialized
+                    st['marked_done'] = marked_done
 
-            # Mark turn as done when AI finishes (for tracking)
-            if sent_this_turn and not marked_done:
-                is_gen = cdp_eval("""
-                    (function() { return !!document.querySelector('[data-stop-button="true"]'); })();
-                """)
-                if not is_gen:
-                    print(f'[monitor] AI done — {len(forwarded_ids)} sections forwarded')
-                    marked_done = True
+                st['last_turn_id'] = last_turn_id
+                st['last_conv'] = last_conv
+                st['last_mc_pcid'] = last_mc_pcid
+                st['last_iid'] = last_iid
+                st['forwarded_ids'] = forwarded_ids
+                st['sent_this_turn'] = sent_this_turn
+                st['prev_by_id'] = prev_by_id
+                st['section_stable'] = section_stable
+                st['initialized'] = initialized
+                st['marked_done'] = marked_done
 
         except Exception as e:
             print(f'[monitor] Error: {e}')
@@ -3125,13 +3448,16 @@ CONTEXT_MONITOR_THRESHOLD = 85
 
 def overview_thread():
     """Periodically rescan CDP targets. Detect new/closed Cursor instances."""
-    global ws, active_instance_id, mirrored_chat
+    global ws, active_instance_id, mirrored_chats
     print('[overview] Starting instance monitor...')
-    if not mirrored_chat and active_instance_id and active_instance_id in instance_registry:
+    if not mirrored_chats and active_instance_id and active_instance_id in instance_registry:
         info = instance_registry[active_instance_id]
         for pc_id, conv in info.get('convs', {}).items():
             if conv['active']:
-                mirrored_chat = (active_instance_id, pc_id, conv['name'])
+                pr = _primary_route()
+                if pr:
+                    mirrored_chats[pr] = (active_instance_id, pc_id, conv['name'])
+                    _persist_mirrored_routes()
                 break
     _overview_start = time.time()
     _scan_cycle = 0
@@ -3188,7 +3514,7 @@ def overview_thread():
                         else:
                             print(f'[overview] Opened: {label}  [{inst["id"][:8]}]')
                             if chat_id and not muted and inst['workspace']:
-                                tg_send(chat_id, f'📂 Workspace opened: {label}')
+                                _tg_notify_all_routes(f'📂 Workspace opened: {label}')
                     except Exception as e:
                         print(f'[overview] Failed to connect to {label}: {e}')
 
@@ -3225,14 +3551,14 @@ def overview_thread():
                     else:
                         print(f'[overview] Closed: {label}  [{iid[:8]}]')
                         if chat_id and not muted:
-                            tg_send(chat_id, f'📂 Workspace closed: {label}')
+                            _tg_notify_all_routes(f'📂 Workspace closed: {label}')
                     if is_active and active_instance_id:
                         new_name = (
                             instance_registry[active_instance_id]['workspace'] or '(no workspace)'
                         )
                         print(f'[overview] Active switched to: {new_name}')
                         if chat_id and not muted and not is_merge:
-                            tg_send(chat_id, f'📂 Workspace activated: {new_name}')
+                            _tg_notify_all_routes(f'📂 Workspace activated: {new_name}')
 
             # Detect workspace changes (e.g. user picked a workspace in empty instance)
             for inst in current:
@@ -3246,7 +3572,7 @@ def overview_thread():
                             f'[overview] Workspace opened: {inst["workspace"]}  [{inst["id"][:8]}]'
                         )
                         if chat_id and not muted:
-                            tg_send(chat_id, f'📂 Workspace opened: {inst["workspace"]}')
+                            _tg_notify_all_routes(f'📂 Workspace opened: {inst["workspace"]}')
 
             # Reconnect dead listeners
             for iid, info in list(instance_registry.items()):
@@ -3381,7 +3707,7 @@ def overview_thread():
                 lines = [f'• {o} → {n}  ({w})' for o, n, w in rename_digest[:35]]
                 if len(rename_digest) > 35:
                     lines.append(f'… +{len(rename_digest) - 35} more')
-                tg_send(chat_id, '💬 Renamed this scan:\n' + '\n'.join(lines))
+                _tg_notify_all_routes('💬 Renamed this scan:\n' + '\n'.join(lines))
 
             if scan_summary:
                 parts = '  '.join(f'{ws} ({n})' for ws, n in scan_summary.items())
@@ -3413,7 +3739,7 @@ OUTBOX_MARKER_RE = re.compile(r'\[PHONE_OUTBOX:([^\]]+)\]')
 phone_outbox.mkdir(exist_ok=True)
 
 
-def outbox_render_and_send(filename, cid, caption=None):
+def outbox_render_and_send(filename, cid, caption=None, message_thread_id=None):
     """Render an outbox file and send it to Telegram. Returns True on success.
 
     Width convention: 'name.w800.md' → render at 800px. Default 450px.
@@ -3463,7 +3789,13 @@ def outbox_render_and_send(filename, cid, caption=None):
             return False
 
     if png_bytes:
-        tg_send_photo_bytes(cid, png_bytes, filename=f'{f.stem}.png', caption=caption)
+        tg_send_photo_bytes(
+            cid,
+            png_bytes,
+            filename=f'{f.stem}.png',
+            caption=caption,
+            message_thread_id=message_thread_id,
+        )
         print(
             f'[outbox] Sent {filename} ({len(png_bytes)} bytes)'
             + (f' with caption ({len(caption)} chars)' if caption else '')

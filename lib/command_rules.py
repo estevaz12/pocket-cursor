@@ -6,9 +6,10 @@ Checks command text against configurable allow/deny patterns.
 Deny always overrides allow. Config lives in lib/command_rules.json
 and is hot-reloaded on change.
 """
+
+import fnmatch
 import json
 import re
-import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +48,12 @@ def _reload_if_changed():
             'deny': _flatten_patterns(data.get('deny', [])),
         }
         _rules_mtime = mt
-        print(f"[command-rules] Loaded {len(_rules['allow'])} allow, "
-              f"{len(_rules['deny'])} deny patterns")
+        print(
+            f'[command-rules] Loaded {len(_rules["allow"])} allow, '
+            f'{len(_rules["deny"])} deny patterns'
+        )
     except Exception as e:
-        print(f"[command-rules] Failed to load rules: {e}")
+        print(f'[command-rules] Failed to load rules: {e}')
 
 
 def match(command_text):
@@ -80,8 +83,10 @@ def match(command_text):
         return None
 
     def allowed(part):
-        return any(fnmatch.fnmatch(part, pat) or fnmatch.fnmatch(part, pat.rstrip(' *'))
-                   for pat in _rules['allow'])
+        return any(
+            fnmatch.fnmatch(part, pat) or fnmatch.fnmatch(part, pat.rstrip(' *'))
+            for pat in _rules['allow']
+        )
 
     if all(allowed(p) for p in parts):
         return 'accept'
