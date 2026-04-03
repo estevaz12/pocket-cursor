@@ -8,12 +8,16 @@ Usage:
 Prints the dictionary ID and version ID to add to your .env file.
 """
 
-import sys
-import io
 import functools
+import io
+import sys
 from pathlib import Path
 
-if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer') and getattr(sys.stdout, 'encoding', '').lower() != 'utf-8':
+if (
+    sys.platform == 'win32'
+    and hasattr(sys.stdout, 'buffer')
+    and getattr(sys.stdout, 'encoding', '').lower() != 'utf-8'
+):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -21,11 +25,13 @@ print = functools.partial(print, flush=True)
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv(Path(__file__).resolve().parent.parent / '.env')
 except ImportError:
     pass
 
 import os
+
 import requests
 
 KEY = os.environ.get('ELEVENLABS_API_KEY', '')
@@ -57,7 +63,7 @@ if resp.status_code not in (200, 201):
     sys.exit(1)
 
 d = resp.json()
-print(f'Uploaded successfully!\n')
-print(f'Add these to your .env:')
+print('Uploaded successfully!\n')
+print('Add these to your .env:')
 print(f'ELEVENLABS_PRONUNCIATION_DICT_ID={d["id"]}')
 print(f'ELEVENLABS_PRONUNCIATION_DICT_VERSION={d["version_id"]}')

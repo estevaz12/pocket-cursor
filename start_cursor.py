@@ -54,12 +54,15 @@ Testing:
     python start_cursor.py --check
 """
 
+import json
+import os
 import re
 import socket
 import subprocess
 import sys
-import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 BASE_PORT = 9222
@@ -86,6 +89,7 @@ def find_cursor():
     else:
         # Linux — check if cursor is in PATH
         import shutil
+
         cursor = shutil.which('cursor')
         if cursor:
             return cursor
@@ -97,27 +101,96 @@ def find_cursor():
     return None
 
 
+def _is_cursor_running_wmic():
+    try:
+        result = subprocess.run(
+            ['wmic', 'process', 'where', "name='Cursor.exe'", 'get', 'processid'],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=15,
+        )
+        return any(line.strip().isdigit() for line in result.stdout.splitlines())
+    except Exception:
+        return False
+
+
+def _is_cursor_running_powershell():
+    """Fallback when WMIC is missing (deprecated / removed on newer Windows)."""
+    ps = "[bool](Get-Process -Name 'Cursor' -ErrorAction SilentlyContinue)"
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=15,
+        )
+        return (result.stdout or '').strip().lower() == 'true'
+    except Exception:
+        return False
+
+
 def is_cursor_running():
     """Check if any Cursor process is running."""
     if sys.platform == 'win32':
-        try:
-            result = subprocess.run(
-                ['wmic', 'process', 'where', "name='Cursor.exe'",
-                 'get', 'processid'],
-                capture_output=True, text=True, encoding='utf-8',
-                errors='replace', timeout=15
-            )
-            return any(line.strip().isdigit() for line in result.stdout.splitlines())
-        except Exception:
-            return False
+        if _is_cursor_running_wmic():
+            return True
+        return _is_cursor_running_powershell()
     else:
         try:
-            result = subprocess.run(
-                ['pgrep', '-f', 'Cursor'], capture_output=True, timeout=10
-            )
+            result = subprocess.run(['pgrep', '-f', 'Cursor'], capture_output=True, timeout=10)
             return result.returncode == 0
         except Exception:
             return False
+
+
+def _cursor_cdp_ports_wmic():
+    """Parse --remote-debugging-port from Cursor.exe command lines via WMIC."""
+    used = set()
+    try:
+        result = subprocess.run(
+            ['wmic', 'process', 'where', "name='Cursor.exe'", 'get', 'commandline'],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=15,
+        )
+        for match in re.findall(r'--remote-debugging-port=(\d+)', result.stdout):
+            used.add(int(match))
+    except Exception:
+        pass
+    return used
+
+
+def _cursor_cdp_ports_powershell():
+    """Same as WMIC path, via Get-CimInstance (works when WMIC is unavailable)."""
+    used = set()
+    ps = (
+        'Get-CimInstance Win32_Process -Filter "Name = \'Cursor.exe\'" | '
+        'Where-Object { $_.CommandLine } | ForEach-Object { '
+        "[regex]::Matches($_.CommandLine, '--remote-debugging-port=(\\d+)') | "
+        'ForEach-Object { $_.Groups[1].Value } }'
+    )
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=30,
+        )
+        for line in (result.stdout or '').splitlines():
+            line = line.strip()
+            if line.isdigit():
+                used.add(int(line))
+    except Exception:
+        pass
+    return used
 
 
 def get_used_ports():
@@ -125,23 +198,12 @@ def get_used_ports():
     used = set()
 
     if sys.platform == 'win32':
-        try:
-            result = subprocess.run(
-                ['wmic', 'process', 'where', "name='Cursor.exe'",
-                 'get', 'commandline'],
-                capture_output=True, text=True, encoding='utf-8',
-                errors='replace', timeout=15
-            )
-            for match in re.findall(r'--remote-debugging-port=(\d+)', result.stdout):
-                used.add(int(match))
-        except Exception:
-            pass
+        used |= _cursor_cdp_ports_wmic()
+        used |= _cursor_cdp_ports_powershell()
     else:
         # Linux / macOS
         try:
-            result = subprocess.run(
-                ['ps', 'aux'], capture_output=True, text=True, timeout=10
-            )
+            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=10)
             for line in result.stdout.splitlines():
                 if 'Cursor' in line or 'cursor' in line:
                     for match in re.findall(r'--remote-debugging-port=(\d+)', line):
@@ -150,6 +212,56 @@ def get_used_ports():
             pass
 
     return sorted(used)
+
+
+def _cdp_targets_look_like_cursor(targets):
+    if not isinstance(targets, list):
+        return False
+    for t in targets:
+        if not isinstance(t, dict):
+            continue
+        url = t.get('url', '') or ''
+        title = t.get('title', '') or ''
+        if 'vscode-file' in url or 'Cursor' in title:
+            return True
+    return False
+
+
+def scan_localhost_for_cdp_ports(start=None, span=24):
+    """Probe localhost for a DevTools /json endpoint that looks like Cursor.
+
+    Used when WMIC/PowerShell command-line enumeration finds nothing but CDP
+    is still listening (rare permission edge cases) or when only the probe
+    can see the port.
+    """
+    if start is None:
+        start = BASE_PORT
+    found = []
+    for port in range(start, start + span):
+        try:
+            with urllib.request.urlopen(f'http://localhost:{port}/json', timeout=0.35) as resp:
+                if resp.status != 200:
+                    continue
+                raw = resp.read()
+                targets = json.loads(raw.decode('utf-8', errors='replace'))
+                if isinstance(targets, list) and _cdp_targets_look_like_cursor(targets):
+                    found.append(port)
+        except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
+            pass
+    return sorted(found)
+
+
+def discover_cdp_ports():
+    """Ports from Cursor command lines, or localhost scan if enumeration is empty.
+
+    Returns (ports, used_probe): used_probe is True when scan_localhost_for_cdp_ports
+    supplied the list (typical when WMIC is unavailable).
+    """
+    ports = get_used_ports()
+    if ports:
+        return ports, False
+    found = scan_localhost_for_cdp_ports()
+    return found, bool(found)
 
 
 def port_is_open(port):
@@ -161,11 +273,11 @@ def port_is_open(port):
 
 def find_available_port(exclude=None, quiet=False):
     """Find the next available CDP port starting from BASE_PORT."""
-    used = get_used_ports()
+    used = set(discover_cdp_ports()[0])
     if exclude:
         used = sorted(set(used) | exclude)
     if used and not quiet:
-        print(f"Ports in use or excluded: {used}")
+        print(f'Ports in use or excluded: {used}')
 
     port = BASE_PORT
     while True:
@@ -176,29 +288,35 @@ def find_available_port(exclude=None, quiet=False):
 
 def count_page_targets(port):
     """Count Cursor page targets on a CDP port.
-    
+
     Matches on vscode-file:// URL (reliable from first load) with
     title-based fallback for edge cases.
     """
-    import urllib.request
     import json as _json
+    import urllib.request
+
     try:
         with urllib.request.urlopen(f'http://localhost:{port}/json', timeout=3) as resp:
             targets = _json.loads(resp.read())
-            return sum(1 for t in targets if t.get('type') == 'page'
-                       and (t.get('url', '').startswith('vscode-file://')
-                            or 'Cursor' in t.get('title', '')))
+            return sum(
+                1
+                for t in targets
+                if t.get('type') == 'page'
+                and (
+                    t.get('url', '').startswith('vscode-file://') or 'Cursor' in t.get('title', '')
+                )
+            )
     except Exception:
         return 0
 
 
 def verify_cdp(port, timeout=15):
     """Poll the CDP endpoint until it responds or timeout is reached.
-    
+
     With timeout=0, performs a single instant check (no polling).
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     url = f'http://localhost:{port}/json'
     deadline = time.time() + timeout
@@ -219,57 +337,61 @@ def main():
     cursor_path = find_cursor()
 
     if not cursor_path:
-        print("ERROR: Could not find Cursor IDE installation.")
+        print('ERROR: Could not find Cursor IDE installation.')
         print()
         if sys.platform == 'win32':
-            print("Expected location: %LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe")
+            print('Expected location: %LOCALAPPDATA%\\Programs\\cursor\\Cursor.exe')
         elif sys.platform == 'darwin':
-            print("Expected location: /Applications/Cursor.app")
+            print('Expected location: /Applications/Cursor.app')
         else:
             print("Expected: 'cursor' in PATH or /usr/bin/cursor")
         print()
-        print("If Cursor is installed elsewhere, launch it manually with:")
-        print("  cursor --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222")
+        print('If Cursor is installed elsewhere, launch it manually with:')
+        print('  cursor --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222')
         sys.exit(1)
 
     # --check mode: just report status, don't launch anything
     if '--check' in sys.argv:
-        ports = get_used_ports()
+        ports, probed = discover_cdp_ports()
         if ports:
-            print(f"Cursor is running with CDP on port {ports[0]}.")
+            print(f'Cursor is running with CDP on port {ports[0]}.')
+            if probed:
+                print('(Port detected via localhost scan; command-line enumeration had no flags.)')
             targets = count_page_targets(ports[0])
-            print(f"Windows: {targets}")
+            print(f'Windows: {targets}')
             sys.exit(0)
         elif is_cursor_running():
-            print("Cursor is running but without CDP.")
+            print('Cursor is running but without CDP.')
             sys.exit(1)
         else:
-            print("Cursor is not running.")
+            print('Cursor is not running.')
             sys.exit(1)
 
     # Check current state of Cursor
-    existing_ports = get_used_ports()
+    existing_ports, _ = discover_cdp_ports()
     cursor_running = is_cursor_running()
 
     if cursor_running and not existing_ports:
         # Cursor is running but WITHOUT CDP. New windows would merge into
         # the existing process and our CDP flags would be ignored.
         # We can't kill Cursor automatically — user may have unsaved work.
-        print("Cursor is running, but without CDP enabled.")
-        print("New windows will join the existing process, so CDP cannot be added.")
+        print('Cursor is running, but without CDP enabled.')
+        print('New windows will join the existing process, so CDP cannot be added.')
         print()
-        print("To fix this:")
-        print("  1. Save your work and close all Cursor windows")
-        print("  2. Run this script again")
+        print('To fix this:')
+        print('  1. Save your work and close all Cursor windows')
+        print('  2. Run this script again')
         print()
-        print("To avoid this in the future, always launch Cursor via this script")
-        print("or add these flags to your desktop shortcut:")
-        print("  --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222")
+        print('To avoid this in the future, always launch Cursor via this script')
+        print('or add these flags to your desktop shortcut:')
+        print('  --remote-debugging-port=9222 --remote-allow-origins=http://localhost:9222')
         sys.exit(1)
 
     if existing_ports:
         if '--port' in sys.argv:
-            print(f"Note: --port is ignored when Cursor is already running (CDP on {existing_ports[0]}).")
+            print(
+                f'Note: --port is ignored when Cursor is already running (CDP on {existing_ports[0]}).'
+            )
         # Cursor already running with CDP.
         # On Windows, new windows merge into the existing process (one port).
         # On other OSes, Electron may or may not merge — we handle both:
@@ -277,11 +399,11 @@ def main():
         #   - Separate: new CDP endpoint appears on new_port
         existing_port = existing_ports[0]
         new_port = find_available_port(quiet=True)
-        print(f"Cursor already running with CDP on port {existing_port}.")
+        print(f'Cursor already running with CDP on port {existing_port}.')
 
         before = count_page_targets(existing_port)
-        print(f"Current windows: {before}")
-        print(f"Launching new window...")
+        print(f'Current windows: {before}')
+        print('Launching new window...')
 
         # Always pass port flags so a separate process gets CDP too
         args = [
@@ -295,26 +417,26 @@ def main():
             subprocess.Popen(args, start_new_session=True)
 
         # Check both possibilities: merged into existing or started separately
-        print(f"Waiting for new window...", end='', flush=True)
+        print('Waiting for new window...', end='', flush=True)
         deadline = time.time() + 15
         while time.time() < deadline:
             # Did it merge into the existing process?
             after = count_page_targets(existing_port)
             if after > before:
-                print(f" OK! Merged into existing process ({after} windows)")
-                print(f"\nCursor is ready with CDP on port {existing_port}.")
-                print(f"Run: python -X utf8 pocket_cursor.py")
+                print(f' OK! Merged into existing process ({after} windows)')
+                print(f'\nCursor is ready with CDP on port {existing_port}.')
+                print('Run: python -X utf8 pocket_cursor.py')
                 return
             # Did it start as a separate process?
             if verify_cdp(new_port, timeout=0):
-                print(f" OK! New instance on port {new_port}")
-                print(f"\nCursor instances on ports: {existing_port}, {new_port}")
-                print(f"Run: python -X utf8 pocket_cursor.py")
+                print(f' OK! New instance on port {new_port}')
+                print(f'\nCursor instances on ports: {existing_port}, {new_port}')
+                print('Run: python -X utf8 pocket_cursor.py')
                 return
             time.sleep(1)
 
-        print(f" window count unchanged ({before}).")
-        print(f"The window may still be loading. CDP is on port {existing_port}.")
+        print(f' window count unchanged ({before}).')
+        print(f'The window may still be loading. CDP is on port {existing_port}.')
         return
 
     # No Cursor running — fresh launch with CDP enabled.
@@ -340,8 +462,8 @@ def main():
             f'--remote-allow-origins=http://localhost:{port}',
         ]
 
-        print(f"Launching Cursor with CDP on port {port}...")
-        print(f"  {' '.join(args)}")
+        print(f'Launching Cursor with CDP on port {port}...')
+        print(f'  {" ".join(args)}')
 
         if sys.platform == 'win32':
             proc = subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS)
@@ -349,16 +471,16 @@ def main():
             proc = subprocess.Popen(args, start_new_session=True)
 
         # Verify CDP actually came up
-        print(f"Waiting for CDP on port {port}...", end='', flush=True)
+        print(f'Waiting for CDP on port {port}...', end='', flush=True)
         if verify_cdp(port):
-            print(f" OK!")
-            print(f"\nCursor is ready with CDP on port {port}.")
-            print(f"Run: python -X utf8 pocket_cursor.py")
+            print(' OK!')
+            print(f'\nCursor is ready with CDP on port {port}.')
+            print('Run: python -X utf8 pocket_cursor.py')
             return
 
         # CDP failed — kill the process and retry
-        print(f" FAILED!")
-        print(f"CDP did not start on port {port}. Killing process and retrying...")
+        print(' FAILED!')
+        print(f'CDP did not start on port {port}. Killing process and retrying...')
         try:
             proc.kill()
         except Exception:
@@ -366,11 +488,11 @@ def main():
         failed_ports.add(port)
 
         if explicit_port is not None:
-            print(f"Explicit port {port} failed. Cannot retry with a different port.")
+            print(f'Explicit port {port} failed. Cannot retry with a different port.')
             sys.exit(1)
 
-    print(f"\nERROR: Failed to start Cursor with CDP after {MAX_RETRIES} attempts.")
-    print(f"Tried ports: {sorted(failed_ports)}")
+    print(f'\nERROR: Failed to start Cursor with CDP after {MAX_RETRIES} attempts.')
+    print(f'Tried ports: {sorted(failed_ports)}')
     sys.exit(1)
 
 

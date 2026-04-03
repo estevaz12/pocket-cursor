@@ -10,10 +10,11 @@ import json
 import re
 import fnmatch
 from pathlib import Path
+from typing import Any
 
 _RULES_FILE = Path(__file__).parent / 'command_rules.json'
 _rules_mtime = 0.0
-_rules = {'allow': [], 'deny': []}
+_rules: dict[str, Any] = {'allow': [], 'deny': []}
 
 # Button priority: most conservative first. "Allow" grants broader
 # permission (whole directory) -- deliberately excluded for now.

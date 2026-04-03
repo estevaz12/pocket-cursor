@@ -23,6 +23,7 @@ alwaysApply: true
 Write JSON to `scripts/voice_message.json`, then run `scripts/voice_message.py`.
 
 **JSON fields** (only `text` required):
+
 - `text`: The message text. Supports Audio Tags: `[excited]`, `[pause]`, `[rushed]`, `[whisper]`, `[sad]`, `[laughs]`, `[slows down]`
 - `language`: `"de"` or `"en"`. Omit for auto-detect.
 - `stability`: 0.0 (expressive), 0.5 (balanced), 1.0 (calm). Vary naturally across messages for a human feel.

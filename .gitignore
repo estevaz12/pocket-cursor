@@ -38,6 +38,10 @@ package-lock.json
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
+.venv-tmp/
+.coverage
+coverage.xml
 
 # IDE / Editor
 .vscode/
