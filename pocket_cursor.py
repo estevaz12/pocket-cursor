@@ -102,6 +102,8 @@ if _raw_forum:
         print(
             'WARNING: TELEGRAM_FORUM_CHAT_ID must be the numeric forum supergroup id (e.g. -100…)'
         )
+_unpin_raw = os.environ.get('TELEGRAM_UNPIN_OUTBOUND', 'true').strip().lower()
+TELEGRAM_UNPIN_OUTBOUND = _unpin_raw not in ('false', '0', 'no', 'off')
 owner_file = Path(__file__).parent / '.owner_id'
 chat_id_file = Path(__file__).parent / '.chat_id'
 active_chat_file = Path(__file__).parent / '.active_chat'
@@ -273,6 +275,27 @@ def _find_forum_route_for_pc(forum_cid: int, iid: str, pc_id: str) -> RouteKey |
     return None
 
 
+def _migrate_mirrored_pc_id(iid: str, old_pc: str, new_pc: str, name: str) -> None:
+    """When Cursor replaces a conversation id (overview fingerprint merge), keep one mirror row.
+
+    Without this, ``_ensure_forum_topic_for_cursor_chat`` sees a new ``pc_id``, does not find the
+    existing forum route, and creates a second Telegram topic for the same chat.
+    """
+    if old_pc == new_pc:
+        return
+    changed = False
+    nm_out = ''
+    with mirrored_chats_lock:
+        for rk, mc in list(mirrored_chats.items()):
+            if mc[0] == iid and mc[1] == old_pc:
+                nm_out = name.strip() if name else mc[2]
+                mirrored_chats[rk] = (iid, new_pc, nm_out)
+                changed = True
+    if changed:
+        _persist_mirrored_routes()
+        print(f'[forum] Migrated mirror pc_id {old_pc[:20]}… → {new_pc[:20]}…  ({nm_out!r})')
+
+
 def tg_create_forum_topic(forum_chat_id: int, name: str) -> int | None:
     """Create a forum topic; returns message_thread_id or None."""
     result = tg_call('createForumTopic', chat_id=forum_chat_id, name=name[:128])
@@ -340,6 +363,27 @@ def tg_call(method, **params):
     return result
 
 
+def _tg_maybe_unpin_outbound(cid: int | None, send_result: dict[str, Any] | None) -> None:
+    """Call unpinChatMessage for messages we just sent (forums may auto-pin bot posts)."""
+    if not TELEGRAM_UNPIN_OUTBOUND or cid is None or not send_result or not send_result.get('ok'):
+        return
+    msg = send_result.get('result')
+    if not isinstance(msg, dict):
+        return
+    mid = msg.get('message_id')
+    if mid is None:
+        return
+    # If the message was not pinned, Telegram returns an error — do not use tg_call (avoids log spam).
+    try:
+        requests.post(
+            f'{TG_API}/unpinChatMessage',
+            json={'chat_id': cid, 'message_id': mid},
+            timeout=60,
+        )
+    except OSError:
+        pass
+
+
 def tg_typing(cid, message_thread_id=None):
     """Show 'typing...' indicator."""
     params: dict[str, Any] = {'chat_id': cid, 'action': 'typing'}
@@ -355,7 +399,9 @@ def tg_send(cid, text, message_thread_id=None):
     if message_thread_id is not None:
         base['message_thread_id'] = message_thread_id
     if len(text) <= 4000:
-        return tg_call('sendMessage', text=text, **base)
+        r = tg_call('sendMessage', text=text, **base)
+        _tg_maybe_unpin_outbound(cid, r)
+        return r
     # Split long messages at line breaks
     chunks = []
     while len(text) > 4000:
@@ -367,7 +413,8 @@ def tg_send(cid, text, message_thread_id=None):
     if text:
         chunks.append(text)
     for chunk in chunks:
-        tg_call('sendMessage', text=chunk, **base)
+        r = tg_call('sendMessage', text=chunk, **base)
+        _tg_maybe_unpin_outbound(cid, r)
         time.sleep(0.3)
 
 
@@ -398,6 +445,7 @@ def tg_send_thinking(cid, text, message_thread_id=None):
         msg = f'_💭 {escaped}_'
         result = tg_call('sendMessage', text=msg, parse_mode='MarkdownV2', **base)
         if result.get('ok'):
+            _tg_maybe_unpin_outbound(cid, result)
             return result
         print(
             f'[telegram] MarkdownV2 failed: {result.get("description", "?")}, falling back to plain text'
@@ -405,7 +453,9 @@ def tg_send_thinking(cid, text, message_thread_id=None):
     except Exception as e:
         print(f'[telegram] MarkdownV2 error: {e}, falling back to plain text')
     # Fallback: plain text with prefix
-    return tg_call('sendMessage', text=f'💭 {text}', **base)
+    r = tg_call('sendMessage', text=f'💭 {text}', **base)
+    _tg_maybe_unpin_outbound(cid, r)
+    return r
 
 
 def tg_send_photo(cid, photo_path, caption=None, message_thread_id=None):
@@ -425,6 +475,8 @@ def tg_send_photo(cid, photo_path, caption=None, message_thread_id=None):
                 desc = result.get('description', '?')
                 code = result.get('error_code', '?')
                 print(f'[telegram] sendPhoto failed: {code} {desc}  ({photo_path})')
+            else:
+                _tg_maybe_unpin_outbound(cid, result)
             return result
     except Exception as e:
         print(f'[telegram] sendPhoto error: {e}')
@@ -454,6 +506,8 @@ def tg_send_photo_bytes(
             desc = result.get('description', '?')
             code = result.get('error_code', '?')
             print(f'[telegram] sendPhoto failed: {code} {desc}  ({len(photo_bytes)} bytes)')
+        else:
+            _tg_maybe_unpin_outbound(cid, result)
         return result
     except Exception as e:
         print(f'[telegram] sendPhoto bytes error: {e}')
@@ -486,6 +540,8 @@ def tg_send_photo_bytes_with_keyboard(
             print(
                 f'[telegram] sendPhoto+keyboard failed: {code} {desc}  ({len(photo_bytes)} bytes)'
             )
+        else:
+            _tg_maybe_unpin_outbound(cid, result)
         return result
     except Exception as e:
         print(f'[telegram] sendPhoto+keyboard error: {e}')
@@ -539,7 +595,7 @@ def tg_register_commands():
 
 def tg_ask_command_update(cid):
     """Send an inline keyboard asking the user to update bot commands."""
-    tg_call(
+    r = tg_call(
         'sendMessage',
         chat_id=cid,
         text='New commands available. Want me to update your Telegram bot menu?',
@@ -552,6 +608,7 @@ def tg_ask_command_update(cid):
             ]
         },
     )
+    _tg_maybe_unpin_outbound(cid, r)
 
 
 def vscode_url_to_path(url):
@@ -2913,7 +2970,8 @@ def sender_thread():
                         }
                         if thr is not None:
                             _mk['message_thread_id'] = thr
-                        tg_call('sendMessage', **_mk)
+                        _r_mk = tg_call('sendMessage', **_mk)
+                        _tg_maybe_unpin_outbound(cid, _r_mk)
                     else:
                         tg_send(cid, 'No open chats right now.', message_thread_id=thr)
                     continue
@@ -3263,9 +3321,7 @@ def monitor_thread():
                                 print('[monitor]   poll exhausted, user_full still empty')
 
                         # Check if this came from Telegram or was typed directly in Cursor
-                        from_telegram = _inbound_sent_matches_siblings(
-                            sibling_routes, user_full
-                        )
+                        from_telegram = _inbound_sent_matches_siblings(sibling_routes, user_full)
 
                         origin = 'Telegram' if from_telegram else 'Cursor'
                         print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
@@ -3509,7 +3565,8 @@ def monitor_thread():
                                     }
                                     if thr is not None:
                                         _cm['message_thread_id'] = thr
-                                    tg_call('sendMessage', **_cm)
+                                    _r_cm = tg_call('sendMessage', **_cm)
+                                    _tg_maybe_unpin_outbound(cid, _r_cm)
 
                         elif not muted:
                             # Only send to Telegram when not muted
@@ -3908,6 +3965,8 @@ def overview_thread():
                             f'[overview] Linked: {d_id} -> {a_id}  score={score}  {mid_info}  "{known_convs[d_id]["name"]}"  in {ws_label}'
                         )
                         known_convs[a_id] = known_convs.pop(d_id)
+                        _nm = (current_convs[a_id].get('name') or '').strip()
+                        _migrate_mirrored_pc_id(iid, d_id, a_id, _nm)
                         matched_a.add(a_id)
                         matched_d.add(d_id)
 
