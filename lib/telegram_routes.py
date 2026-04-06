@@ -47,11 +47,15 @@ def route_key_from_message(msg: Mapping[str, Any]) -> RouteKey:
 
 def route_binding_to_json(binding: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize a persisted route value to JSON-serializable dict."""
-    return {
+    out: dict[str, Any] = {
         'workspace': binding.get('workspace'),
         'pc_id': binding.get('pc_id'),
         'chat_name': binding.get('chat_name'),
     }
+    mid = binding.get('msg_id')
+    if mid:
+        out['msg_id'] = mid
+    return out
 
 
 def load_routes_json(path: Path) -> dict[RouteKey, dict[str, Any]]:
@@ -69,11 +73,14 @@ def load_routes_json(path: Path) -> dict[RouteKey, dict[str, Any]]:
             rk = RouteKey.from_storage_key(k)
         except ValueError:
             continue
-        out[rk] = {
+        row: dict[str, Any] = {
             'workspace': v.get('workspace'),
             'pc_id': v.get('pc_id'),
             'chat_name': v.get('chat_name'),
         }
+        if v.get('msg_id'):
+            row['msg_id'] = v['msg_id']
+        out[rk] = row
     return out
 
 
@@ -109,22 +116,24 @@ def canonical_outbound_route(
 
 
 def group_routes_by_mirror(
-    items: Sequence[tuple[RouteKey, tuple[str, str, str]]],
+    items: Sequence[tuple[RouteKey, Any]],
     *,
     forum_chat_id: int | None,
     last_sender: RouteKey | None,
-) -> list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]]:
+) -> list[tuple[RouteKey, Any, list[RouteKey]]]:
     """One row per Cursor composer (same ``instance_id`` + ``pc_id``).
 
     RouteKeys that share ``(iid, pc_id)`` but differ in stored ``chat_name`` (e.g. one
     row still says \"New Agent\" after a rename) must stay one group — otherwise the
     monitor forwards the same turn to multiple Telegram topics.
     """
-    by_comp: dict[tuple[str, str], list[tuple[RouteKey, tuple[str, str, str]]]] = {}
+    by_comp: dict[tuple[str, str], list[tuple[RouteKey, Any]]] = {}
     for rk, mc in items:
-        iid, pc_id, _nm = mc
+        if not isinstance(mc, (tuple, list)) or len(mc) < 3:
+            continue
+        iid, pc_id, _nm = mc[0], mc[1], mc[2]
         by_comp.setdefault((iid, pc_id), []).append((rk, mc))
-    out: list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]] = []
+    out: list[tuple[RouteKey, Any, list[RouteKey]]] = []
     for _key, pairs in by_comp.items():
         rks = [p[0] for p in pairs]
         mc = max(pairs, key=lambda p: len(p[1][2]))[1]
@@ -158,6 +167,11 @@ def routes_for_global_bot_notify(
         rk for rk in route_keys if rk.chat_id == forum_chat_id and rk.message_thread_id is None
     ]
     return non_forum + (forum_general[:1] if forum_general else [])
+
+
+def normalize_mirror_chat_name(name: str) -> str:
+    """Normalize chat title for comparing mirror rows (whitespace + case-insensitive)."""
+    return ' '.join((name or '').split()).strip().casefold()
 
 
 def forum_topic_title(chat_name: str, pc_id: str) -> str:

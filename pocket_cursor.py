@@ -48,6 +48,7 @@ from lib.telegram_routes import (
     group_routes_by_mirror,
     load_routes_json,
     migrate_legacy_route_files,
+    normalize_mirror_chat_name,
     route_key_from_message,
     routes_for_global_bot_notify,
     save_routes_json,
@@ -115,9 +116,31 @@ ws = None  # Active instance's WebSocket (all cdp_* functions use this)
 _browser_ws_url = None  # Browser-level WebSocket URL (cached at connect time)
 instance_registry: dict[Any, Any] = {}  # {target_id: {workspace, ws, ws_url, title}}
 active_instance_id = None  # Which instance ws points to
-# Per Telegram route → (instance_id, pc_id, chat_name) mirrored to Cursor
-mirrored_chats: dict[RouteKey, tuple[str, str, str]] = {}
+# Per Telegram route → (instance_id, pc_id, chat_name, msg_fingerprint?) mirrored to Cursor.
+# msg_fingerprint = last human message id from DOM (stable across pc_id retags).
+MirrorRow = tuple[str, str, str, str | None]
+mirrored_chats: dict[RouteKey, MirrorRow] = {}
 mirrored_chats_lock = threading.Lock()
+
+
+def _norm_msg_fp(fp: str | None) -> str | None:
+    if fp is None:
+        return None
+    s = str(fp).strip()
+    return s or None
+
+
+def _normalize_mirror_row(mc: MirrorRow | tuple[str, str, str]) -> MirrorRow:
+    """Upgrade legacy 3-tuples to 4-tuples."""
+    if len(mc) >= 4:
+        return (mc[0], mc[1], mc[2], _norm_msg_fp(mc[3]))
+    return (mc[0], mc[1], mc[2], None)
+
+
+def _mirror_row(iid: str, pc_id: str, name: str, msg_fp: str | None = None) -> MirrorRow:
+    return (iid, pc_id, name, _norm_msg_fp(msg_fp))
+
+
 # When a forum topic is deleted, map (forum_chat_id, old_thread_id) → new_thread_id for the same tick.
 _forum_thread_remap_lock = threading.Lock()
 _forum_thread_remap: dict[tuple[int, int], int] = {}
@@ -220,7 +243,7 @@ def _prune_forum_general_route_if_redundant() -> None:
     print('[forum] Dropped General mirror; using topic routes only.')
 
 
-def _mirror_for_inbound(route: RouteKey) -> tuple[str, str, str] | None:
+def _mirror_for_inbound(route: RouteKey) -> MirrorRow | None:
     """Resolve Cursor mirror for a Telegram route (exact RouteKey only).
 
     We intentionally do **not** fall back to ``RouteKey(chat_id, None)`` when the message has
@@ -252,25 +275,42 @@ def _persist_mirrored_routes() -> None:
     try:
         bind: dict[RouteKey, dict[str, Any]] = {}
         with mirrored_chats_lock:
-            for rk, (iid, pc_id, name) in mirrored_chats.items():
+            for rk, mc in mirrored_chats.items():
+                iid, pc_id, name, msg_fp = _normalize_mirror_row(mc)
                 info = instance_registry.get(iid, {})
-                bind[rk] = {
+                row: dict[str, Any] = {
                     'workspace': info.get('workspace'),
                     'pc_id': pc_id,
                     'chat_name': name,
                 }
+                if msg_fp:
+                    row['msg_id'] = msg_fp
+                bind[rk] = row
         save_routes_json(routes_file, bind)
     except OSError:
         pass
 
 
-def _find_forum_route_for_pc(forum_cid: int, iid: str, pc_id: str) -> RouteKey | None:
+def _find_forum_route_for_pc(
+    forum_cid: int,
+    iid: str,
+    pc_id: str,
+    name: str | None = None,
+    msg_fingerprint: str | None = None,
+) -> RouteKey | None:
     """Return the Telegram route for this Cursor chat in the forum, if any.
 
     Prefer ``(instance_id, pc_id)`` match. If the same ``pc_id`` is bound under another
     CDP instance (user switched the same chat to a different Cursor window), reuse that
     topic so we do not create a duplicate when switching agents back and forth.
+
+    If ``pc_id`` does not match any row (Cursor retagged the tab after a switch — e.g.
+    composer ``cid-…`` vs stable ``pc-…`` in ``list_chats``), match by conversation
+    fingerprint (human message id, else last message id in thread, else ``cid:`` + full
+    composer UUID for empty threads), then by unique normalized title, or msg_id to
+    disambiguate duplicate titles.
     """
+    fp = _norm_msg_fp(msg_fingerprint)
     with mirrored_chats_lock:
         fallback: RouteKey | None = None
         for rk, mc in mirrored_chats.items():
@@ -278,7 +318,42 @@ def _find_forum_route_for_pc(forum_cid: int, iid: str, pc_id: str) -> RouteKey |
                 if mc[0] == iid:
                     return rk
                 fallback = rk
-        return fallback
+        if fallback is not None:
+            return fallback
+        if fp:
+            msg_hits: list[RouteKey] = []
+            for rk, mc in mirrored_chats.items():
+                m = _normalize_mirror_row(mc)
+                if (
+                    rk.chat_id == forum_cid
+                    and rk.message_thread_id is not None
+                    and m[0] == iid
+                    and m[3] == fp
+                ):
+                    msg_hits.append(rk)
+            if len(msg_hits) == 1:
+                return msg_hits[0]
+        nn = normalize_mirror_chat_name(name) if name else ''
+        if nn:
+            candidates: list[RouteKey] = []
+            for rk, mc in mirrored_chats.items():
+                m = _normalize_mirror_row(mc)
+                if (
+                    rk.chat_id == forum_cid
+                    and rk.message_thread_id is not None
+                    and m[0] == iid
+                    and normalize_mirror_chat_name(m[2]) == nn
+                ):
+                    candidates.append(rk)
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) > 1 and fp:
+                fp_hits = [
+                    rk for rk in candidates if _normalize_mirror_row(mirrored_chats[rk])[3] == fp
+                ]
+                if len(fp_hits) == 1:
+                    return fp_hits[0]
+        return None
 
 
 def _migrate_mirrored_pc_id(iid: str, old_pc: str, new_pc: str, name: str) -> None:
@@ -295,7 +370,8 @@ def _migrate_mirrored_pc_id(iid: str, old_pc: str, new_pc: str, name: str) -> No
         for rk, mc in list(mirrored_chats.items()):
             if mc[0] == iid and mc[1] == old_pc:
                 nm_out = name.strip() if name else mc[2]
-                mirrored_chats[rk] = (iid, new_pc, nm_out)
+                m = _normalize_mirror_row(mc)
+                mirrored_chats[rk] = _mirror_row(iid, new_pc, nm_out, m[3])
                 changed = True
     if changed:
         _persist_mirrored_routes()
@@ -312,7 +388,9 @@ def tg_create_forum_topic(forum_chat_id: int, name: str) -> int | None:
     return int(tid) if tid is not None else None
 
 
-def _ensure_forum_topic_for_cursor_chat(iid: str, pc_id: str, name: str) -> RouteKey | None:
+def _ensure_forum_topic_for_cursor_chat(
+    iid: str, pc_id: str, name: str, msg_fingerprint: str | None = None
+) -> RouteKey | None:
     """Ensure a Telegram forum topic exists for this Cursor chat; set mirror + last_sender_route.
 
     Skips provisional tabs (pc-*). Requires TELEGRAM_FORUM_CHAT_ID and bot admin + Manage topics.
@@ -323,16 +401,20 @@ def _ensure_forum_topic_for_cursor_chat(iid: str, pc_id: str, name: str) -> Rout
     if pc_id.startswith('pc-'):
         return None
     title = forum_topic_title(name, pc_id)
-    existing = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id)
+    existing = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, name, msg_fingerprint)
+    fp = _norm_msg_fp(msg_fingerprint)
     if existing:
         with mirrored_chats_lock:
             prev = mirrored_chats.get(existing)
-            if prev == (iid, pc_id, name):
+            pm = _normalize_mirror_row(prev) if prev else None
+            merged_fp = fp or (pm[3] if pm else None)
+            row = _mirror_row(iid, pc_id, name, merged_fp)
+            if pm == row:
                 last_sender_route = existing
                 return existing
-            mirrored_chats[existing] = (iid, pc_id, name)
+            mirrored_chats[existing] = row
         _persist_mirrored_routes()
-        if prev and prev[2] != name:
+        if pm and pm[2] != name:
             tg_call(
                 'editForumTopic',
                 chat_id=FORUM_CHAT_ID,
@@ -349,7 +431,7 @@ def _ensure_forum_topic_for_cursor_chat(iid: str, pc_id: str, name: str) -> Rout
         return None
     rk = RouteKey(FORUM_CHAT_ID, tid)
     with mirrored_chats_lock:
-        mirrored_chats[rk] = (iid, pc_id, name)
+        mirrored_chats[rk] = _mirror_row(iid, pc_id, name, fp)
     last_sender_route = rk
     _persist_mirrored_routes()
     print(f'[forum] Topic for {name!r} → thread_id={tid}')
@@ -396,9 +478,10 @@ def _recover_stale_forum_topic_after_failed_send(
     if last_sender_route == rk:
         last_sender_route = None
 
-    iid, pc_id, name = mc
+    m = _normalize_mirror_row(mc)
+    iid, pc_id, name, msg_fp = m
     print(f'[forum] Topic deleted (thread {tid_used}); recreating for {name!r}  ({pc_id[:16]}…)')
-    new_rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name)
+    new_rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name, msg_fp)
     new_tid = new_rk.message_thread_id if new_rk else None
     if new_tid is not None:
         with _forum_thread_remap_lock:
@@ -938,6 +1021,7 @@ def _handle_chat_switch(iid, data):
     global _switch_debounce_timer, _switch_debounce_pre_pcid
     pc_id = data.get('pc_id', '')
     name = data.get('name', '')
+    msg_fp = _norm_msg_fp(data.get('msg_id'))
     if not pc_id:
         return
 
@@ -949,7 +1033,7 @@ def _handle_chat_switch(iid, data):
     if FORUM_CHAT_ID is not None:
         if pc_id.startswith('pc-'):
             return
-        rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name)
+        rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name, msg_fp)
         if rk is None:
             return
         same_chat_new_window = pc_id == cur_pc_id_prev and iid != cur_iid_prev
@@ -965,7 +1049,10 @@ def _handle_chat_switch(iid, data):
                 return
             same_chat_new_window = pc_id == cur_pc_id and iid != cur_iid
             if rk is not None:
-                mirrored_chats[rk] = (iid, pc_id, name)
+                curm = mirrored_chats.get(rk)
+                mp = _normalize_mirror_row(curm) if curm else None
+                merged = _norm_msg_fp(msg_fp) or (mp[3] if mp else None)
+                mirrored_chats[rk] = _mirror_row(iid, pc_id, name, merged)
     if iid != active_instance_id:
         with cdp_lock:
             active_instance_id = iid
@@ -978,8 +1065,14 @@ def _handle_chat_switch(iid, data):
     # Seed the overview's known_convs so it can detect renames.
     # Without this, a new chat created and auto-renamed before the next
     # overview scan would never be seen under its original name ("New Chat").
-    if not is_provisional and 'convs' in info and pc_id not in info['convs']:
-        info['convs'][pc_id] = {'name': name, 'active': True, 'msg_id': None}
+    if not is_provisional and 'convs' in info:
+        if pc_id not in info['convs']:
+            info['convs'][pc_id] = {'name': name, 'active': True, 'msg_id': msg_fp}
+        else:
+            info['convs'][pc_id]['name'] = name
+            info['convs'][pc_id]['active'] = True
+            if msg_fp:
+                info['convs'][pc_id]['msg_id'] = msg_fp
     if chat_id and not muted and not is_provisional and not same_chat_new_window:
         with _switch_debounce_lock:
             if _switch_debounce_timer:
@@ -1019,10 +1112,11 @@ def _handle_chat_rename(iid, data):
     with mirrored_chats_lock:
         for rk, mc in list(mirrored_chats.items()):
             if mc[0] == iid and mc[1] == pc_id:
-                mirrored_chats[rk] = (iid, pc_id, name)
+                m = _normalize_mirror_row(mc)
+                mirrored_chats[rk] = _mirror_row(iid, pc_id, name, m[3])
     _persist_mirrored_routes()
     if FORUM_CHAT_ID is not None:
-        ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id)
+        ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, name)
         if ex and ex.message_thread_id is not None:
             tg_call(
                 'editForumTopic',
@@ -1164,6 +1258,7 @@ def cdp_connect():
         saved_ws = binding.get('workspace')
         saved_pc_id = binding.get('pc_id')
         saved_name = binding.get('chat_name')
+        saved_msg = _norm_msg_fp(binding.get('msg_id'))
         if not saved_pc_id and not saved_name:
             continue
         for wid, info in instance_registry.items():
@@ -1171,7 +1266,9 @@ def cdp_connect():
                 continue
             for pc_id, conv in info.get('convs', {}).items():
                 if pc_id == saved_pc_id or conv['name'] == saved_name:
-                    mirrored_chats[rk] = (wid, pc_id, conv['name'])
+                    live_fp = _norm_msg_fp(conv.get('msg_id'))
+                    fp = live_fp or saved_msg
+                    mirrored_chats[rk] = _mirror_row(wid, pc_id, conv['name'], fp)
                     if active_instance_id is None:
                         active_instance_id = wid
                         print(
@@ -1908,12 +2005,13 @@ def cdp_activate_agent_tab(conn, resolved_pc_id: str, resolved_name: str) -> str
     )
 
 
-def cursor_switch_to_mirrored(mc: tuple[str, str, str] | None) -> None:
+def cursor_switch_to_mirrored(mc: MirrorRow | tuple[str, str, str] | None) -> None:
     """Bring the Cursor window to front and activate the mirrored agent tab."""
     global active_instance_id, ws
     if not mc:
         return
-    iid, pc_id, name = mc
+    m = _normalize_mirror_row(mc)
+    iid, pc_id, name = m[0], m[1], m[2]
     info = instance_registry.get(iid)
     if not info:
         return
@@ -2784,11 +2882,15 @@ def sender_thread():
                                     else (resolved_name or resolved_pc_id)
                                 )
                                 if cb_route is not None:
+                                    convs = info.get('convs') or {}
+                                    cv = convs.get(resolved_pc_id) or {}
+                                    _fp = _norm_msg_fp(cv.get('msg_id'))
                                     with mirrored_chats_lock:
-                                        mirrored_chats[cb_route] = (
+                                        mirrored_chats[cb_route] = _mirror_row(
                                             target_iid,
                                             resolved_pc_id,
                                             chat_label,
+                                            _fp,
                                         )
                                     _persist_mirrored_routes()
                                 tg_call(
@@ -3199,7 +3301,8 @@ def _reconcile_mirrored_chat_from_dom():
     mc = mirrored_chats.get(rk)
     if not mc:
         return False
-    iid, pc_id, name = mc
+    m = _normalize_mirror_row(mc)
+    iid, pc_id, name, old_fp = m
     info = instance_registry.get(iid)
     if not info:
         return False
@@ -3224,10 +3327,11 @@ def _reconcile_mirrored_chat_from_dom():
     if not apc or apc == pc_id:
         return False
     new_name = (active.get('name') or '').strip() or name
+    fp = _norm_msg_fp(active.get('msg_id')) or old_fp
     with mirrored_chats_lock:
-        for k, m in list(mirrored_chats.items()):
-            if m[0] == iid and m[1] == pc_id:
-                mirrored_chats[k] = (iid, apc, new_name)
+        for k, row in list(mirrored_chats.items()):
+            if row[0] == iid and row[1] == pc_id:
+                mirrored_chats[k] = _mirror_row(iid, apc, new_name, fp)
     _persist_mirrored_routes()
     print(f'[monitor] Reconciled active chat from DOM: {new_name!r}')
     return True
@@ -3248,7 +3352,7 @@ def _new_monitor_state() -> dict[str, Any]:
     }
 
 
-def _monitor_route_entries() -> list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]]:
+def _monitor_route_entries() -> list[tuple[RouteKey, Any, list[RouteKey]]]:
     """Deduplicate monitor work: one poll per Cursor chat, one Telegram thread per outbound."""
     with mirrored_chats_lock:
         items = list(mirrored_chats.items())
@@ -3338,7 +3442,8 @@ def monitor_thread():
                         )
                         with mirrored_chats_lock:
                             for rk in sibling_routes:
-                                mirrored_chats[rk] = (found_iid, mc[1], mc[2])
+                                mm = _normalize_mirror_row(mc)
+                                mirrored_chats[rk] = _mirror_row(found_iid, mm[1], mm[2], mm[3])
                         last_iid = found_iid
                         last_mc_pcid = mc[1]
                         last_turn_id = turn['turn_id']
@@ -3882,27 +3987,30 @@ def overview_thread():
         for pc_id, conv in info.get('convs', {}).items():
             if conv['active']:
                 if FORUM_CHAT_ID is not None and not str(pc_id).startswith('pc-'):
+                    _fp = _norm_msg_fp(conv.get('msg_id'))
                     _rk = _ensure_forum_topic_for_cursor_chat(
-                        active_instance_id, pc_id, conv['name']
+                        active_instance_id, pc_id, conv['name'], _fp
                     )
                     if _rk is None:
                         pr = _primary_route()
                         if pr:
                             with mirrored_chats_lock:
-                                mirrored_chats[pr] = (
+                                mirrored_chats[pr] = _mirror_row(
                                     active_instance_id,
                                     pc_id,
                                     conv['name'],
+                                    _fp,
                                 )
                             _persist_mirrored_routes()
                 else:
                     pr = _primary_route()
                     if pr:
                         with mirrored_chats_lock:
-                            mirrored_chats[pr] = (
+                            mirrored_chats[pr] = _mirror_row(
                                 active_instance_id,
                                 pc_id,
                                 conv['name'],
+                                _norm_msg_fp(conv.get('msg_id')),
                             )
                         _persist_mirrored_routes()
                 break
@@ -4134,7 +4242,8 @@ def overview_thread():
                     )
                     if FORUM_CHAT_ID is not None and not pc_id.startswith('pc-'):
                         _nm = (current_convs[pc_id].get('name') or '').strip()
-                        _ensure_forum_topic_for_cursor_chat(iid, pc_id, _nm)
+                        _fp = _norm_msg_fp(current_convs[pc_id].get('msg_id'))
+                        _ensure_forum_topic_for_cursor_chat(iid, pc_id, _nm, _fp)
 
                 for pc_id in disappeared:
                     print(

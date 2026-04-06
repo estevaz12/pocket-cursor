@@ -195,6 +195,28 @@ _LISTENER_JS = r"""
         return null;
     }
 
+    function conversationFingerprintFromComposer() {
+        const composerPanel = document.querySelector('.composite.auxiliarybar .composer-messages-container')
+            || document.querySelector('.auxiliarybar .composer-messages-container');
+        if (composerPanel) {
+            const humans = composerPanel.querySelectorAll('[data-message-kind="human"][data-message-id]');
+            if (humans.length) {
+                return humans[humans.length - 1].getAttribute('data-message-id');
+            }
+            const anyMsg = composerPanel.querySelectorAll('[data-message-id]');
+            if (anyMsg.length) {
+                return anyMsg[anyMsg.length - 1].getAttribute('data-message-id');
+            }
+        }
+        const cid = getComposerId();
+        return (cid && /^[0-9a-f]{8}-/.test(cid)) ? ('cid:' + cid) : null;
+    }
+
+    function attachMsgFingerprint(chat) {
+        const fp = conversationFingerprintFromComposer();
+        if (fp) chat.msg_id = fp;
+    }
+
     let lastChatName = null;
 
     function report(evType, el, chat, sw, rn) {
@@ -217,6 +239,7 @@ _LISTENER_JS = r"""
         if (chat && chat.pc_id && chat.pc_id !== lastPcId) {
             lastPcId = chat.pc_id;
             lastChatName = chat.name;
+            attachMsgFingerprint(chat);
             report(e.type, el, chat, true);
             return;
         }
@@ -238,6 +261,7 @@ _LISTENER_JS = r"""
                 if (chat.pc_id && chat.pc_id !== lastPcId) {
                     lastPcId = chat.pc_id;
                     lastChatName = chat.name;
+                    attachMsgFingerprint(chat);
                     report(e.type, el, chat, true);
                 } else {
                     report(e.type, el, chat, false);
@@ -288,10 +312,19 @@ _LIST_CHATS_JS = r"""
         return (cid && /^[0-9a-f]{8}-/.test(cid)) ? cid : '';
     }
 
-    function lastHumanMsgId(container) {
-        const msgs = container.querySelectorAll('[data-message-kind="human"][data-message-id]');
-        if (msgs.length === 0) return null;
-        return msgs[msgs.length - 1].getAttribute('data-message-id');
+    function conversationFingerprintForPanel(container) {
+        if (container) {
+            const humans = container.querySelectorAll('[data-message-kind="human"][data-message-id]');
+            if (humans.length) {
+                return humans[humans.length - 1].getAttribute('data-message-id');
+            }
+            const anyMsg = container.querySelectorAll('[data-message-id]');
+            if (anyMsg.length) {
+                return anyMsg[anyMsg.length - 1].getAttribute('data-message-id');
+            }
+        }
+        const cid = getComposerId();
+        return (cid && /^[0-9a-f]{8}-/.test(cid)) ? ('cid:' + cid) : null;
     }
 
     // Deterministic id when Cursor has no stable uuid (replaces Math.random so IDs survive sidebar rebuilds
@@ -333,8 +366,8 @@ _LIST_CHATS_JS = r"""
             };
             const panel = group.querySelector('.composer-messages-container');
             if (panel && tabEl.classList.contains('active')) {
-                const mid = lastHumanMsgId(panel);
-                if (mid) entry.msg_id = mid;
+                const fp = conversationFingerprintForPanel(panel);
+                if (fp) entry.msg_id = fp;
             }
             results.push(entry);
         });
@@ -343,7 +376,7 @@ _LIST_CHATS_JS = r"""
     // 2. Agent-tabs: only retag if new cid won't collide with editor-group
     const composerPanel = document.querySelector('.composite.auxiliarybar .composer-messages-container')
                        || document.querySelector('.auxiliarybar .composer-messages-container');
-    const activeMsgId = composerPanel ? lastHumanMsgId(composerPanel) : null;
+    const activeFingerprint = composerPanel ? conversationFingerprintForPanel(composerPanel) : null;
 
     const agentTabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
     agentTabs.forEach((a, aidx) => {
@@ -373,7 +406,7 @@ _LIST_CHATS_JS = r"""
             name: a.getAttribute('aria-label') || a.textContent.trim() || '',
             active: isChecked
         };
-        if (isChecked && activeMsgId) entry.msg_id = activeMsgId;
+        if (isChecked && activeFingerprint) entry.msg_id = activeFingerprint;
         results.push(entry);
     });
 
@@ -395,7 +428,7 @@ _LIST_CHATS_JS = r"""
             title0 = (cell.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
         }
 
-        if (isChecked && activeMsgId) {
+        if (isChecked && activeFingerprint) {
             const cid = getComposerId();
             if (cid) {
                 const newPcId = cidFromUuid(cid);
@@ -416,7 +449,7 @@ _LIST_CHATS_JS = r"""
             name: title0,
             active: isChecked
         };
-        if (isChecked && activeMsgId) entry.msg_id = activeMsgId;
+        if (isChecked && activeFingerprint) entry.msg_id = activeFingerprint;
         results.push(entry);
     });
 
@@ -511,7 +544,9 @@ def list_chats(eval_fn):
 
     eval_fn: callable(js_string) -> value, e.g. lambda js: cdp_eval_on(conn, js).
     Returns list of dicts: [{pc_id, name, active, msg_id?}].
-    msg_id is the last human message UUID (stable conversation fingerprint).
+    msg_id is a conversation fingerprint: prefer last human message id, else last
+    message id in the thread (e.g. AI welcome), else \"cid:\" + full data-composer-id
+    when the thread is still empty (no human message required).
     """
     result = eval_fn(_LIST_CHATS_JS)
     try:
