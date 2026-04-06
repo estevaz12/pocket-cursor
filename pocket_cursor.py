@@ -118,6 +118,9 @@ active_instance_id = None  # Which instance ws points to
 # Per Telegram route → (instance_id, pc_id, chat_name) mirrored to Cursor
 mirrored_chats: dict[RouteKey, tuple[str, str, str]] = {}
 mirrored_chats_lock = threading.Lock()
+# When a forum topic is deleted, map (forum_chat_id, old_thread_id) → new_thread_id for the same tick.
+_forum_thread_remap_lock = threading.Lock()
+_forum_thread_remap: dict[tuple[int, int], int] = {}
 # Last Telegram route that received a message or callback (DOM chat switch updates this route)
 last_sender_route: RouteKey | None = None
 # Load chat_id from disk so PC messages work after restart without a Telegram message first
@@ -262,17 +265,20 @@ def _persist_mirrored_routes() -> None:
 
 
 def _find_forum_route_for_pc(forum_cid: int, iid: str, pc_id: str) -> RouteKey | None:
-    """Return the Telegram route for this Cursor chat in the forum, if any."""
+    """Return the Telegram route for this Cursor chat in the forum, if any.
+
+    Prefer ``(instance_id, pc_id)`` match. If the same ``pc_id`` is bound under another
+    CDP instance (user switched the same chat to a different Cursor window), reuse that
+    topic so we do not create a duplicate when switching agents back and forth.
+    """
     with mirrored_chats_lock:
+        fallback: RouteKey | None = None
         for rk, mc in mirrored_chats.items():
-            if (
-                rk.chat_id == forum_cid
-                and rk.message_thread_id is not None
-                and mc[0] == iid
-                and mc[1] == pc_id
-            ):
-                return rk
-    return None
+            if rk.chat_id == forum_cid and rk.message_thread_id is not None and mc[1] == pc_id:
+                if mc[0] == iid:
+                    return rk
+                fallback = rk
+        return fallback
 
 
 def _migrate_mirrored_pc_id(iid: str, old_pc: str, new_pc: str, name: str) -> None:
@@ -353,6 +359,56 @@ def _ensure_forum_topic_for_cursor_chat(iid: str, pc_id: str, name: str) -> Rout
 # ── Telegram helpers ─────────────────────────────────────────────────────────
 
 
+def _forum_resolve_thread_id(cid: int | None, message_thread_id: int | None) -> int | None:
+    """Apply remap after a deleted topic was replaced in-process (same monitor tick)."""
+    if cid is None or message_thread_id is None or FORUM_CHAT_ID is None:
+        return message_thread_id
+    if cid != FORUM_CHAT_ID:
+        return message_thread_id
+    with _forum_thread_remap_lock:
+        return _forum_thread_remap.get((cid, message_thread_id), message_thread_id)
+
+
+def _recover_stale_forum_topic_after_failed_send(
+    result: dict[str, Any],
+    cid: int,
+    tid_used: int | None,
+) -> int | None:
+    """Topic was deleted in Telegram: drop route, recreate topic, return new thread_id if any."""
+    if result.get('ok') or tid_used is None:
+        return None
+    desc = str(result.get('description', '')).lower()
+    if 'message thread not found' not in desc and 'thread not found' not in desc:
+        return None
+    if FORUM_CHAT_ID is None or cid != FORUM_CHAT_ID:
+        return None
+
+    rk = RouteKey(cid, tid_used)
+    with mirrored_chats_lock:
+        mc = mirrored_chats.pop(rk, None)
+    if not mc:
+        with _forum_thread_remap_lock:
+            mapped = _forum_thread_remap.get((cid, tid_used))
+        return mapped
+
+    _persist_mirrored_routes()
+    global last_sender_route
+    if last_sender_route == rk:
+        last_sender_route = None
+
+    iid, pc_id, name = mc
+    print(f'[forum] Topic deleted (thread {tid_used}); recreating for {name!r}  ({pc_id[:16]}…)')
+    new_rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name)
+    new_tid = new_rk.message_thread_id if new_rk else None
+    if new_tid is not None:
+        with _forum_thread_remap_lock:
+            _forum_thread_remap[(cid, tid_used)] = new_tid
+            if len(_forum_thread_remap) > 128:
+                for k in list(_forum_thread_remap)[:32]:
+                    _forum_thread_remap.pop(k, None)
+    return new_tid
+
+
 def tg_call(method, **params):
     resp = requests.post(f'{TG_API}/{method}', json=params, timeout=60)
     result = resp.json()
@@ -386,20 +442,33 @@ def _tg_maybe_unpin_outbound(cid: int | None, send_result: dict[str, Any] | None
 
 def tg_typing(cid, message_thread_id=None):
     """Show 'typing...' indicator."""
+    tid = _forum_resolve_thread_id(cid, message_thread_id)
     params: dict[str, Any] = {'chat_id': cid, 'action': 'typing'}
-    if message_thread_id is not None:
-        params['message_thread_id'] = message_thread_id
-    return tg_call('sendChatAction', **params)
+    if tid is not None:
+        params['message_thread_id'] = tid
+    r = tg_call('sendChatAction', **params)
+    if not r.get('ok'):
+        n = _recover_stale_forum_topic_after_failed_send(r, cid, tid)
+        if n is not None:
+            params['message_thread_id'] = n
+            r = tg_call('sendChatAction', **params)
+    return r
 
 
 def tg_send(cid, text, message_thread_id=None):
     if not cid:
         return
+    tid = _forum_resolve_thread_id(cid, message_thread_id)
     base: dict[str, Any] = {'chat_id': cid}
-    if message_thread_id is not None:
-        base['message_thread_id'] = message_thread_id
+    if tid is not None:
+        base['message_thread_id'] = tid
     if len(text) <= 4000:
         r = tg_call('sendMessage', text=text, **base)
+        if not r.get('ok'):
+            n = _recover_stale_forum_topic_after_failed_send(r, cid, tid)
+            if n is not None:
+                base['message_thread_id'] = n
+                r = tg_call('sendMessage', text=text, **base)
         _tg_maybe_unpin_outbound(cid, r)
         return r
     # Split long messages at line breaks
@@ -413,9 +482,38 @@ def tg_send(cid, text, message_thread_id=None):
     if text:
         chunks.append(text)
     for chunk in chunks:
+        tid = _forum_resolve_thread_id(cid, message_thread_id)
+        base = {'chat_id': cid}
+        if tid is not None:
+            base['message_thread_id'] = tid
         r = tg_call('sendMessage', text=chunk, **base)
+        if not r.get('ok'):
+            n = _recover_stale_forum_topic_after_failed_send(r, cid, tid)
+            if n is not None:
+                base['message_thread_id'] = n
+                r = tg_call('sendMessage', text=chunk, **base)
         _tg_maybe_unpin_outbound(cid, r)
         time.sleep(0.3)
+
+
+def _tg_send_message_forum_aware(payload: dict[str, Any]) -> dict[str, Any]:
+    """sendMessage with resolve + recreate when the forum topic was deleted."""
+    cid = payload['chat_id']
+    raw_tid = payload.get('message_thread_id')
+    tid = _forum_resolve_thread_id(cid, raw_tid)
+    pl = dict(payload)
+    if tid is not None:
+        pl['message_thread_id'] = tid
+    elif 'message_thread_id' in pl:
+        pl.pop('message_thread_id')
+    r = tg_call('sendMessage', **pl)
+    if not r.get('ok'):
+        n = _recover_stale_forum_topic_after_failed_send(r, cid, tid)
+        if n is not None:
+            pl = dict(payload)
+            pl['message_thread_id'] = n
+            r = tg_call('sendMessage', **pl)
+    return r
 
 
 def tg_escape_markdown_v2(text):
@@ -430,9 +528,10 @@ def tg_send_thinking(cid, text, message_thread_id=None):
     """
     if not cid or not text:
         return
+    tid = _forum_resolve_thread_id(cid, message_thread_id)
     base: dict[str, Any] = {'chat_id': cid}
-    if message_thread_id is not None:
-        base['message_thread_id'] = message_thread_id
+    if tid is not None:
+        base['message_thread_id'] = tid
     # Truncate if very long (thinking can be verbose)
     if len(text) > 3500:
         cut = text[:3500].rfind('\n')
@@ -444,6 +543,11 @@ def tg_send_thinking(cid, text, message_thread_id=None):
         escaped = tg_escape_markdown_v2(text)
         msg = f'_💭 {escaped}_'
         result = tg_call('sendMessage', text=msg, parse_mode='MarkdownV2', **base)
+        if not result.get('ok'):
+            n = _recover_stale_forum_topic_after_failed_send(result, cid, tid)
+            if n is not None:
+                base['message_thread_id'] = n
+                result = tg_call('sendMessage', text=msg, parse_mode='MarkdownV2', **base)
         if result.get('ok'):
             _tg_maybe_unpin_outbound(cid, result)
             return result
@@ -454,6 +558,11 @@ def tg_send_thinking(cid, text, message_thread_id=None):
         print(f'[telegram] MarkdownV2 error: {e}, falling back to plain text')
     # Fallback: plain text with prefix
     r = tg_call('sendMessage', text=f'💭 {text}', **base)
+    if not r.get('ok'):
+        n = _recover_stale_forum_topic_after_failed_send(r, cid, tid)
+        if n is not None:
+            base['message_thread_id'] = n
+            r = tg_call('sendMessage', text=f'💭 {text}', **base)
     _tg_maybe_unpin_outbound(cid, r)
     return r
 
@@ -463,19 +572,31 @@ def tg_send_photo(cid, photo_path, caption=None, message_thread_id=None):
     if not cid or not photo_path:
         return
     try:
+        tid = _forum_resolve_thread_id(cid, message_thread_id)
         with open(photo_path, 'rb') as f:
             data: dict[str, Any] = {'chat_id': cid}
-            if message_thread_id is not None:
-                data['message_thread_id'] = message_thread_id
+            if tid is not None:
+                data['message_thread_id'] = tid
             if caption:
                 data['caption'] = caption[:1024]  # Telegram caption limit
             resp = requests.post(f'{TG_API}/sendPhoto', data=data, files={'photo': f}, timeout=30)
             result = resp.json()
             if not result.get('ok'):
-                desc = result.get('description', '?')
-                code = result.get('error_code', '?')
-                print(f'[telegram] sendPhoto failed: {code} {desc}  ({photo_path})')
-            else:
+                n = _recover_stale_forum_topic_after_failed_send(result, cid, tid)
+                if n is not None:
+                    f.seek(0)
+                    data = {'chat_id': cid, 'message_thread_id': n}
+                    if caption:
+                        data['caption'] = caption[:1024]
+                    resp = requests.post(
+                        f'{TG_API}/sendPhoto', data=data, files={'photo': f}, timeout=30
+                    )
+                    result = resp.json()
+                if not result.get('ok'):
+                    desc = result.get('description', '?')
+                    code = result.get('error_code', '?')
+                    print(f'[telegram] sendPhoto failed: {code} {desc}  ({photo_path})')
+            if result.get('ok'):
                 _tg_maybe_unpin_outbound(cid, result)
             return result
     except Exception as e:
@@ -490,9 +611,10 @@ def tg_send_photo_bytes(
     if not cid or not photo_bytes:
         return
     try:
+        tid = _forum_resolve_thread_id(cid, message_thread_id)
         data: dict[str, Any] = {'chat_id': cid}
-        if message_thread_id is not None:
-            data['message_thread_id'] = message_thread_id
+        if tid is not None:
+            data['message_thread_id'] = tid
         if caption:
             data['caption'] = caption[:1024]
         resp = requests.post(
@@ -503,10 +625,23 @@ def tg_send_photo_bytes(
         )
         result = resp.json()
         if not result.get('ok'):
-            desc = result.get('description', '?')
-            code = result.get('error_code', '?')
-            print(f'[telegram] sendPhoto failed: {code} {desc}  ({len(photo_bytes)} bytes)')
-        else:
+            n = _recover_stale_forum_topic_after_failed_send(result, cid, tid)
+            if n is not None:
+                data = {'chat_id': cid, 'message_thread_id': n}
+                if caption:
+                    data['caption'] = caption[:1024]
+                resp = requests.post(
+                    f'{TG_API}/sendPhoto',
+                    data=data,
+                    files={'photo': (filename, photo_bytes, 'image/png')},
+                    timeout=30,
+                )
+                result = resp.json()
+            if not result.get('ok'):
+                desc = result.get('description', '?')
+                code = result.get('error_code', '?')
+                print(f'[telegram] sendPhoto failed: {code} {desc}  ({len(photo_bytes)} bytes)')
+        if result.get('ok'):
             _tg_maybe_unpin_outbound(cid, result)
         return result
     except Exception as e:
@@ -521,9 +656,10 @@ def tg_send_photo_bytes_with_keyboard(
     if not cid or not photo_bytes:
         return None
     try:
+        tid = _forum_resolve_thread_id(cid, message_thread_id)
         data: dict[str, Any] = {'chat_id': cid}
-        if message_thread_id is not None:
-            data['message_thread_id'] = message_thread_id
+        if tid is not None:
+            data['message_thread_id'] = tid
         if caption:
             data['caption'] = caption[:1024]
         data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
@@ -535,12 +671,29 @@ def tg_send_photo_bytes_with_keyboard(
         )
         result = resp.json()
         if not result.get('ok'):
-            desc = result.get('description', '?')
-            code = result.get('error_code', '?')
-            print(
-                f'[telegram] sendPhoto+keyboard failed: {code} {desc}  ({len(photo_bytes)} bytes)'
-            )
-        else:
+            n = _recover_stale_forum_topic_after_failed_send(result, cid, tid)
+            if n is not None:
+                data = {
+                    'chat_id': cid,
+                    'message_thread_id': n,
+                    'reply_markup': json.dumps({'inline_keyboard': keyboard}),
+                }
+                if caption:
+                    data['caption'] = caption[:1024]
+                resp = requests.post(
+                    f'{TG_API}/sendPhoto',
+                    data=data,
+                    files={'photo': (filename, photo_bytes, 'image/png')},
+                    timeout=30,
+                )
+                result = resp.json()
+            if not result.get('ok'):
+                desc = result.get('description', '?')
+                code = result.get('error_code', '?')
+                print(
+                    f'[telegram] sendPhoto+keyboard failed: {code} {desc}  ({len(photo_bytes)} bytes)'
+                )
+        if result.get('ok'):
             _tg_maybe_unpin_outbound(cid, result)
         return result
     except Exception as e:
@@ -2972,7 +3125,7 @@ def sender_thread():
                         }
                         if thr is not None:
                             _mk['message_thread_id'] = thr
-                        _r_mk = tg_call('sendMessage', **_mk)
+                        _r_mk = _tg_send_message_forum_aware(_mk)
                         _tg_maybe_unpin_outbound(cid, _r_mk)
                     else:
                         tg_send(cid, 'No open chats right now.', message_thread_id=thr)
@@ -3567,7 +3720,7 @@ def monitor_thread():
                                     }
                                     if thr is not None:
                                         _cm['message_thread_id'] = thr
-                                    _r_cm = tg_call('sendMessage', **_cm)
+                                    _r_cm = _tg_send_message_forum_aware(_cm)
                                     _tg_maybe_unpin_outbound(cid, _r_cm)
 
                         elif not muted:
