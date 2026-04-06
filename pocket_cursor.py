@@ -43,10 +43,13 @@ from lib import command_rules
 from lib.observability import init_sentry
 from lib.telegram_routes import (
     RouteKey,
+    canonical_outbound_route,
     forum_topic_title,
+    group_routes_by_mirror,
     load_routes_json,
     migrate_legacy_route_files,
     route_key_from_message,
+    routes_for_broadcast,
     save_routes_json,
 )
 
@@ -149,11 +152,67 @@ def _confirm_callback_key(tool_id: str) -> str:
     return h
 
 
+def _is_forum_general_route(rk: RouteKey | None) -> bool:
+    """Telegram forum \"General\" is ``message_thread_id is None`` for the forum supergroup."""
+    if rk is None or FORUM_CHAT_ID is None:
+        return False
+    return rk.chat_id == FORUM_CHAT_ID and rk.message_thread_id is None
+
+
 def _primary_route() -> RouteKey | None:
-    """Default DM route for this bridge (no forum topic)."""
+    """Default route without a forum thread (DM or plain supergroup).
+
+    When ``TELEGRAM_FORUM_CHAT_ID`` equals the stored ``.chat_id``, that row would be
+    forum General — we return None so callers use real topic routes instead.
+    """
     if chat_id is None:
         return None
+    if FORUM_CHAT_ID is not None and chat_id == FORUM_CHAT_ID:
+        return None
     return RouteKey(chat_id, None)
+
+
+def _preferred_telegram_route() -> RouteKey | None:
+    """Where to send Telegram lines not tied to a specific inbound message.
+
+    Prefers ``last_sender_route`` / canonical forum topic; avoids forum General whenever
+    a threaded forum route exists in ``mirrored_chats``.
+    """
+    if FORUM_CHAT_ID is None:
+        return last_sender_route or _primary_route()
+
+    with mirrored_chats_lock:
+        forum_routes = [rk for rk in mirrored_chats if rk.chat_id == FORUM_CHAT_ID]
+    if forum_routes:
+        ls = last_sender_route if last_sender_route in forum_routes else None
+        return canonical_outbound_route(
+            forum_routes,
+            forum_chat_id=FORUM_CHAT_ID,
+            last_sender=ls,
+        )
+
+    if last_sender_route and not _is_forum_general_route(last_sender_route):
+        return last_sender_route
+    return _primary_route()
+
+
+def _prune_forum_general_route_if_redundant() -> None:
+    """Drop ``RouteKey(forum, None)`` from mirrors when at least one real topic exists."""
+    if FORUM_CHAT_ID is None:
+        return
+    general = RouteKey(FORUM_CHAT_ID, None)
+    with mirrored_chats_lock:
+        if general not in mirrored_chats:
+            return
+        has_topic = any(
+            rk.chat_id == FORUM_CHAT_ID and rk.message_thread_id is not None
+            for rk in mirrored_chats
+        )
+        if not has_topic:
+            return
+        del mirrored_chats[general]
+    _persist_mirrored_routes()
+    print('[forum] Dropped General mirror; using topic routes only.')
 
 
 def _mirror_for_inbound(route: RouteKey) -> tuple[str, str, str] | None:
@@ -620,15 +679,20 @@ _CHAT_ACTIVATED_COOLDOWN_S = 25.0
 
 
 def _tg_notify_all_routes(text: str) -> None:
-    """Send a system line to every Telegram route (forum topics each get a copy)."""
+    """Send a system line to Telegram routes (forum: real topics only, not General, when possible)."""
     if muted:
         return
     with mirrored_chats_lock:
         rks = list(mirrored_chats.keys())
     if not rks:
         if chat_id:
-            tg_send(chat_id, text)
+            # Never post without thread into a forum supergroup (that is General).
+            if FORUM_CHAT_ID is not None and chat_id == FORUM_CHAT_ID:
+                pass
+            else:
+                tg_send(chat_id, text)
         return
+    rks = routes_for_broadcast(rks, forum_chat_id=FORUM_CHAT_ID)
     for rk in rks:
         tg_send(rk.chat_id, text, message_thread_id=rk.message_thread_id)
 
@@ -636,7 +700,7 @@ def _tg_notify_all_routes(text: str) -> None:
 def _send_chat_activated_telegram(text: str) -> None:
     """At most one 'Chat activated' every COOLDOWN seconds (any text) — DOM listeners can race."""
     global _last_chat_activated_mono
-    r = last_sender_route or _primary_route()
+    r = _preferred_telegram_route()
     if not r or muted:
         return
     now = time.monotonic()
@@ -908,6 +972,8 @@ def cdp_connect():
                     break
             if rk in mirrored_chats:
                 break
+
+    _prune_forum_general_route_if_redundant()
 
     if not active_instance_id:
         active_instance_id = next(
@@ -2914,7 +2980,7 @@ def _forwarded_id_seed_from_sections(sections):
 def _reconcile_mirrored_chat_from_dom():
     """If DOM active tab != mirror for last Telegram route, sync (fast tab switches)."""
     global mirrored_chats
-    rk = last_sender_route or _primary_route()
+    rk = _preferred_telegram_route()
     if rk is None:
         return False
     mc = mirrored_chats.get(rk)
@@ -2945,8 +3011,10 @@ def _reconcile_mirrored_chat_from_dom():
     if not apc or apc == pc_id:
         return False
     new_name = (active.get('name') or '').strip() or name
-    with _switch_lock:
-        mirrored_chats[rk] = (iid, apc, new_name)
+    with mirrored_chats_lock:
+        for k, m in list(mirrored_chats.items()):
+            if m[0] == iid and m[1] == pc_id:
+                mirrored_chats[k] = (iid, apc, new_name)
     _persist_mirrored_routes()
     print(f'[monitor] Reconciled active chat from DOM: {new_name!r}')
     return True
@@ -2967,6 +3035,28 @@ def _new_monitor_state() -> dict[str, Any]:
     }
 
 
+def _monitor_route_entries() -> list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]]:
+    """Deduplicate monitor work: one poll per Cursor chat, one Telegram thread per outbound."""
+    with mirrored_chats_lock:
+        items = list(mirrored_chats.items())
+    return group_routes_by_mirror(
+        items,
+        forum_chat_id=FORUM_CHAT_ID,
+        last_sender=last_sender_route,
+    )
+
+
+def _inbound_sent_matches_siblings(sibling_routes: list[RouteKey], user_full: str) -> bool:
+    if not user_full:
+        return False
+    with last_sent_lock:
+        for rk in sibling_routes:
+            sent = last_sent_by_route.get(rk)
+            if sent and (sent[:30] in user_full or sent == '[photo]'):
+                return True
+    return False
+
+
 def monitor_thread():
     print('[monitor] Starting Cursor monitor...')
     route_states: dict[RouteKey, dict[str, Any]] = {}
@@ -2983,17 +3073,17 @@ def monitor_thread():
 
             _reconcile_mirrored_chat_from_dom()
 
-            with mirrored_chats_lock:
-                routes_list = list(mirrored_chats.items())
-            if not routes_list:
+            entries = _monitor_route_entries()
+            if not entries:
                 continue
 
             # Same Cursor composer may be registered under multiple RouteKeys (e.g. DM + forum);
             # only prefill context-monitor text once per tick per (instance, pc_id).
             context_prefill_done: set[tuple[str, str]] = set()
 
-            for route, mc in routes_list:
-                st = route_states.setdefault(route, _new_monitor_state())
+            for route, mc, sibling_routes in entries:
+                mirror_key = (mc[0], mc[1])
+                st = route_states.setdefault(mirror_key, _new_monitor_state())
                 last_turn_id = st['last_turn_id']
                 last_conv = st['last_conv']
                 last_mc_pcid = st['last_mc_pcid']
@@ -3034,7 +3124,8 @@ def monitor_thread():
                             f'[monitor] Composer {cp} moved to {ws_label}, skipping {len(turn["sections"])} existing'
                         )
                         with mirrored_chats_lock:
-                            mirrored_chats[route] = (found_iid, mc[1], mc[2])
+                            for rk in sibling_routes:
+                                mirrored_chats[rk] = (found_iid, mc[1], mc[2])
                         last_iid = found_iid
                         last_mc_pcid = mc[1]
                         last_turn_id = turn['turn_id']
@@ -3172,9 +3263,9 @@ def monitor_thread():
                                 print('[monitor]   poll exhausted, user_full still empty')
 
                         # Check if this came from Telegram or was typed directly in Cursor
-                        with last_sent_lock:
-                            sent = last_sent_by_route.get(route)
-                        from_telegram = sent and (sent[:30] in user_full or sent == '[photo]')
+                        from_telegram = _inbound_sent_matches_siblings(
+                            sibling_routes, user_full
+                        )
 
                         origin = 'Telegram' if from_telegram else 'Cursor'
                         print(f"[monitor] New turn ({origin}): '{user_full[:50]}'")
@@ -3578,10 +3669,30 @@ def overview_thread():
         info = instance_registry[active_instance_id]
         for pc_id, conv in info.get('convs', {}).items():
             if conv['active']:
-                pr = _primary_route()
-                if pr:
-                    mirrored_chats[pr] = (active_instance_id, pc_id, conv['name'])
-                    _persist_mirrored_routes()
+                if FORUM_CHAT_ID is not None and not str(pc_id).startswith('pc-'):
+                    _rk = _ensure_forum_topic_for_cursor_chat(
+                        active_instance_id, pc_id, conv['name']
+                    )
+                    if _rk is None:
+                        pr = _primary_route()
+                        if pr:
+                            with mirrored_chats_lock:
+                                mirrored_chats[pr] = (
+                                    active_instance_id,
+                                    pc_id,
+                                    conv['name'],
+                                )
+                            _persist_mirrored_routes()
+                else:
+                    pr = _primary_route()
+                    if pr:
+                        with mirrored_chats_lock:
+                            mirrored_chats[pr] = (
+                                active_instance_id,
+                                pc_id,
+                                conv['name'],
+                            )
+                        _persist_mirrored_routes()
                 break
     _overview_start = time.time()
     _scan_cycle = 0

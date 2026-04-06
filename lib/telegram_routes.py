@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -83,6 +84,69 @@ def save_routes_json(path: Path, routes: Mapping[RouteKey, Mapping[str, Any]]) -
         'routes': {rk.to_storage_key(): dict(route_binding_to_json(v)) for rk, v in routes.items()},
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+
+
+def canonical_outbound_route(
+    candidates: list[RouteKey],
+    *,
+    forum_chat_id: int | None,
+    last_sender: RouteKey | None,
+) -> RouteKey:
+    """When several Telegram routes share the same Cursor mirror, pick one for outbound sends.
+
+    Prefer ``last_sender`` if it is among the candidates (matches the topic the user used).
+    Otherwise prefer a real forum thread over the General row (``message_thread_id is None``).
+    """
+    if not candidates:
+        raise ValueError('candidates must be non-empty')
+    if last_sender is not None and last_sender in candidates:
+        return last_sender
+    if forum_chat_id is not None:
+        threaded = [c for c in candidates if c.message_thread_id is not None]
+        if threaded:
+            return min(threaded, key=lambda r: r.message_thread_id or 0)
+    return candidates[0]
+
+
+def group_routes_by_mirror(
+    items: Sequence[tuple[RouteKey, tuple[str, str, str]]],
+    *,
+    forum_chat_id: int | None,
+    last_sender: RouteKey | None,
+) -> list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]]:
+    """One row per Cursor composer; siblings are all RouteKeys with the same mirror tuple."""
+    by_mirror: dict[tuple[str, str, str], list[RouteKey]] = {}
+    for rk, mc in items:
+        by_mirror.setdefault(mc, []).append(rk)
+    out: list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]] = []
+    for mc, rks in by_mirror.items():
+        canon = canonical_outbound_route(
+            rks, forum_chat_id=forum_chat_id, last_sender=last_sender
+        )
+        out.append((canon, mc, rks))
+    return out
+
+
+def routes_for_broadcast(
+    route_keys: list[RouteKey],
+    *,
+    forum_chat_id: int | None,
+) -> list[RouteKey]:
+    """Avoid posting system lines to forum General when real topic routes exist.
+
+    Still includes non-forum routes (e.g. DM) so those keep receiving workspace alerts.
+    """
+    if forum_chat_id is None:
+        return route_keys
+    forum_topics = [
+        rk
+        for rk in route_keys
+        if rk.chat_id == forum_chat_id and rk.message_thread_id is not None
+    ]
+    if not forum_topics:
+        return route_keys
+    non_forum = [rk for rk in route_keys if rk.chat_id != forum_chat_id]
+    return forum_topics + non_forum
 
 
 def forum_topic_title(chat_name: str, pc_id: str) -> str:
