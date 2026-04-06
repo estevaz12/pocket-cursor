@@ -114,39 +114,50 @@ def group_routes_by_mirror(
     forum_chat_id: int | None,
     last_sender: RouteKey | None,
 ) -> list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]]:
-    """One row per Cursor composer; siblings are all RouteKeys with the same mirror tuple."""
-    by_mirror: dict[tuple[str, str, str], list[RouteKey]] = {}
+    """One row per Cursor composer (same ``instance_id`` + ``pc_id``).
+
+    RouteKeys that share ``(iid, pc_id)`` but differ in stored ``chat_name`` (e.g. one
+    row still says \"New Agent\" after a rename) must stay one group — otherwise the
+    monitor forwards the same turn to multiple Telegram topics.
+    """
+    by_comp: dict[tuple[str, str], list[tuple[RouteKey, tuple[str, str, str]]]] = {}
     for rk, mc in items:
-        by_mirror.setdefault(mc, []).append(rk)
+        iid, pc_id, _nm = mc
+        by_comp.setdefault((iid, pc_id), []).append((rk, mc))
     out: list[tuple[RouteKey, tuple[str, str, str], list[RouteKey]]] = []
-    for mc, rks in by_mirror.items():
-        canon = canonical_outbound_route(
-            rks, forum_chat_id=forum_chat_id, last_sender=last_sender
-        )
+    for _key, pairs in by_comp.items():
+        rks = [p[0] for p in pairs]
+        mc = max(pairs, key=lambda p: len(p[1][2]))[1]
+        canon = canonical_outbound_route(rks, forum_chat_id=forum_chat_id, last_sender=last_sender)
         out.append((canon, mc, rks))
     return out
 
 
-def routes_for_broadcast(
+def routes_for_global_bot_notify(
     route_keys: list[RouteKey],
     *,
     forum_chat_id: int | None,
+    last_sender: RouteKey | None,
 ) -> list[RouteKey]:
-    """Avoid posting system lines to forum General when real topic routes exist.
+    """Where to send workspace / scan system lines (not per-agent Cursor output).
 
-    Still includes non-forum routes (e.g. DM) so those keep receiving workspace alerts.
+    Use **one** forum topic plus any non-forum routes (e.g. DM). Broadcasting the same
+    line to every forum topic duplicates it in Telegram's \"All topics\" view.
     """
     if forum_chat_id is None:
         return route_keys
-    forum_topics = [
-        rk
-        for rk in route_keys
-        if rk.chat_id == forum_chat_id and rk.message_thread_id is not None
-    ]
-    if not forum_topics:
-        return route_keys
     non_forum = [rk for rk in route_keys if rk.chat_id != forum_chat_id]
-    return forum_topics + non_forum
+    forum_threaded = [
+        rk for rk in route_keys if rk.chat_id == forum_chat_id and rk.message_thread_id is not None
+    ]
+    if forum_threaded:
+        if last_sender is not None and last_sender in forum_threaded:
+            return non_forum + [last_sender]
+        return non_forum + [min(forum_threaded, key=lambda r: r.message_thread_id or 0)]
+    forum_general = [
+        rk for rk in route_keys if rk.chat_id == forum_chat_id and rk.message_thread_id is None
+    ]
+    return non_forum + (forum_general[:1] if forum_general else [])
 
 
 def forum_topic_title(chat_name: str, pc_id: str) -> str:

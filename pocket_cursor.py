@@ -49,7 +49,7 @@ from lib.telegram_routes import (
     load_routes_json,
     migrate_legacy_route_files,
     route_key_from_message,
-    routes_for_broadcast,
+    routes_for_global_bot_notify,
     save_routes_json,
 )
 
@@ -736,7 +736,7 @@ _CHAT_ACTIVATED_COOLDOWN_S = 25.0
 
 
 def _tg_notify_all_routes(text: str) -> None:
-    """Send a system line to Telegram routes (forum: real topics only, not General, when possible)."""
+    """Send a system line (workspace / scan digest): one forum topic + DMs, not every topic."""
     if muted:
         return
     with mirrored_chats_lock:
@@ -749,7 +749,9 @@ def _tg_notify_all_routes(text: str) -> None:
             else:
                 tg_send(chat_id, text)
         return
-    rks = routes_for_broadcast(rks, forum_chat_id=FORUM_CHAT_ID)
+    rks = routes_for_global_bot_notify(
+        rks, forum_chat_id=FORUM_CHAT_ID, last_sender=last_sender_route
+    )
     for rk in rks:
         tg_send(rk.chat_id, text, message_thread_id=rk.message_thread_id)
 
