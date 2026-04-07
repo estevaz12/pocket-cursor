@@ -234,3 +234,69 @@ def migrate_legacy_route_files(
             'chat_name': saved.get('chat_name'),
         }
     }
+
+
+def norm_msg_fp(fp: str | None) -> str | None:
+    """Strip conversation fingerprint from DOM / persisted JSON (shared with bridge)."""
+    if fp is None:
+        return None
+    s = str(fp).strip()
+    return s or None
+
+
+def fp_equiv(a: str | None, b: str | None) -> bool:
+    """True if two fingerprints likely denote the same Cursor thread (case / whitespace tolerant)."""
+    x = norm_msg_fp(a)
+    y = norm_msg_fp(b)
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    return x.casefold() == y.casefold()
+
+
+def norm_chat_name_for_match(name: str | None) -> str:
+    """Normalize chat title for stable equality (whitespace + case)."""
+    if not name:
+        return ''
+    return ' '.join(str(name).split()).casefold()
+
+
+def is_risky_generic_chat_name(name: str | None) -> bool:
+    """When True, skip stronger pc_id migration heuristics that could merge unrelated tabs."""
+    t = norm_chat_name_for_match(name)
+    if len(t) < 4:
+        return True
+    if t in ('new chat', 'new agent', 'chat', 'agent', 'untitled'):
+        return True
+    return False
+
+
+def composer_id_prefix_from_pc_id(pc_id: str | None) -> str:
+    """UUID prefix for ``data-composer-id`` scoping (``cid-abc12345`` → ``abc12345``)."""
+    if pc_id and str(pc_id).startswith('cid-'):
+        return str(pc_id)[4:]
+    return ''
+
+
+def monitor_unscoped_turn_belongs_to_mirror(
+    active_tab_title: str | None,
+    mirror_chat_name: str | None,
+    pc_id: str | None,
+) -> bool:
+    """Whether a globally-scoped DOM turn read can be attributed to this mirror.
+
+    When ``pc_id`` is ``cid-*``, the bridge scopes ``cursor_get_turn_info`` to that composer.
+
+    For ``pc-*`` ids there is no composer prefix, so the evaluator reads the visible composer
+    for every route — only the row whose mirror name matches the active tab should forward.
+    """
+    if composer_id_prefix_from_pc_id(pc_id):
+        return True
+    dom_conv = norm_chat_name_for_match(active_tab_title)
+    mirror_name = norm_chat_name_for_match(mirror_chat_name)
+    if not mirror_name:
+        return False
+    if not dom_conv:
+        return False
+    return dom_conv == mirror_name

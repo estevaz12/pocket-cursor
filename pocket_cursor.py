@@ -44,10 +44,15 @@ from lib.observability import init_sentry
 from lib.telegram_routes import (
     RouteKey,
     canonical_outbound_route,
+    composer_id_prefix_from_pc_id,
     forum_topic_title,
+    fp_equiv,
     group_routes_by_mirror,
+    is_risky_generic_chat_name,
     load_routes_json,
     migrate_legacy_route_files,
+    monitor_unscoped_turn_belongs_to_mirror,
+    norm_chat_name_for_match,
     route_key_from_message,
     routes_for_global_bot_notify,
     save_routes_json,
@@ -356,11 +361,14 @@ def _find_forum_route_for_pc(
     iid: str,
     pc_id: str,
     msg_fingerprint: str | None = None,
+    *,
+    chat_name: str | None = None,
 ) -> RouteKey | None:
     """Return the Telegram route for this Cursor chat in the forum, if any.
 
-    Matching is **id-only** (no chat titles): ``(instance_id, pc_id)``, cross-window same
-    ``pc_id``, or unique stored conversation fingerprint. Never title match.
+    Matching is **id-first**: ``(instance_id, pc_id)``, cross-window same ``pc_id``,
+    then conversation fingerprint (``fp_equiv`` tolerant). If several threads share the
+    same fingerprint, ``chat_name`` disambiguates when it matches exactly one row.
     """
     fp = _norm_msg_fp(msg_fingerprint)
     with mirrored_chats_lock:
@@ -380,11 +388,22 @@ def _find_forum_route_for_pc(
                     rk.chat_id == forum_cid
                     and rk.message_thread_id is not None
                     and m[0] == iid
-                    and m[3] == fp
+                    and m[3]
+                    and fp_equiv(m[3], fp)
                 ):
                     msg_hits.append(rk)
             if len(msg_hits) == 1:
                 return msg_hits[0]
+            if len(msg_hits) > 1 and chat_name:
+                want = norm_chat_name_for_match(chat_name)
+                if want:
+                    narrowed = [
+                        rk
+                        for rk in msg_hits
+                        if norm_chat_name_for_match(mirrored_chats[rk][2]) == want
+                    ]
+                    if len(narrowed) == 1:
+                        return narrowed[0]
         return None
 
 
@@ -435,7 +454,7 @@ def _ensure_forum_topic_for_cursor_chat(
     if pc_id.startswith('pc-'):
         return None
     title = forum_topic_title(name, pc_id)
-    existing = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, msg_fingerprint)
+    existing = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, msg_fingerprint, chat_name=name)
     fp = _norm_msg_fp(msg_fingerprint)
     if existing:
         with mirrored_chats_lock:
@@ -1175,7 +1194,7 @@ def _handle_chat_rename(iid, data):
                 mirrored_chats[rk] = _mirror_row(iid, pc_id, name, m[3])
     _persist_mirrored_routes()
     if FORUM_CHAT_ID is not None:
-        ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, None)
+        ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, None, chat_name=name)
         if ex and ex.message_thread_id is not None:
             tg_call(
                 'editForumTopic',
@@ -3378,9 +3397,16 @@ def short_id(sid):
 
 def _composer_prefix_from_pcid(pc_id):
     """Extract composer-id prefix from a pc_id like 'cid-b625b741' → 'b625b741'."""
-    if pc_id and pc_id.startswith('cid-'):
-        return pc_id[4:]
-    return ''
+    return composer_id_prefix_from_pc_id(pc_id)
+
+
+def _monitor_globally_scoped_turn_matches_mirror(turn: dict[str, Any], mc: Any) -> bool:
+    """See ``monitor_unscoped_turn_belongs_to_mirror``."""
+    if not mc or len(mc) < 3:
+        return True
+    return monitor_unscoped_turn_belongs_to_mirror(
+        turn.get('conv'), mc[2], mc[1]
+    )
 
 
 def _forwarded_id_seed_from_sections(sections):
@@ -3562,6 +3588,9 @@ def monitor_thread():
                         section_stable = {}
                         sent_this_turn = False
                         marked_done = False
+                        continue
+
+                    if mc and not _monitor_globally_scoped_turn_matches_mirror(turn, mc):
                         continue
 
                     turn_id = turn['turn_id']  # Unique DOM id per turn
@@ -4289,6 +4318,7 @@ def overview_thread():
 
                 if disappeared and appeared:
                     scores = {}  # (appeared_id, disappeared_id) → score
+                    singleton_pair = len(disappeared) == 1 and len(appeared) == 1
                     for a_id in appeared:
                         a = current_convs[a_id]
                         for d_id in disappeared:
@@ -4296,9 +4326,21 @@ def overview_thread():
                             score = 0
                             a_mid = a.get('msg_id')
                             d_mid = d.get('msg_id')
-                            if a_mid and d_mid and a_mid == d_mid:
+                            if a_mid and d_mid and fp_equiv(a_mid, d_mid):
                                 score += 3
-                            if a.get('name') == d.get('name'):
+                            elif (
+                                singleton_pair
+                                and norm_chat_name_for_match(a.get('name'))
+                                == norm_chat_name_for_match(d.get('name'))
+                                and norm_chat_name_for_match(a.get('name'))
+                                and not is_risky_generic_chat_name(a.get('name', ''))
+                                and ((a_mid and not d_mid) or (d_mid and not a_mid))
+                            ):
+                                # DOM lag: one snapshot has fingerprint, other not yet — same 1:1 retag
+                                score += 2
+                            if norm_chat_name_for_match(a.get('name')) == norm_chat_name_for_match(
+                                d.get('name')
+                            ) and norm_chat_name_for_match(a.get('name')):
                                 score += 1
                             if score > 0:
                                 scores[(a_id, d_id)] = score
