@@ -174,6 +174,29 @@ def normalize_mirror_chat_name(name: str) -> str:
     return ' '.join((name or '').split()).strip().casefold()
 
 
+def mirror_title_unsafe_for_title_only_match(name: str) -> bool:
+    """True if we must not bind a forum topic using *only* matching chat title.
+
+    Cursor gives many fresh agents the same default label (e.g. \"New chat session\").
+    Reusing the sole topic with that title would attach unrelated agents to one Telegram
+    thread. Fingerprint or ``pc_id`` matching is still allowed.
+    """
+    nn = normalize_mirror_chat_name(name)
+    if not nn:
+        return True
+    if nn in frozenset({'chat', 'agent', 'untitled', 'untitled chat'}):
+        return True
+    parts = nn.split()
+    if len(parts) >= 2 and parts[0] == 'new':
+        if parts[1] == 'chat':
+            return len(parts) == 2 or (len(parts) == 3 and parts[2] == 'session')
+        if parts[1] == 'agent':
+            return len(parts) == 2 or (len(parts) == 3 and parts[2] == 'session')
+        if parts[1] == 'conversation' and len(parts) == 2:
+            return True
+    return False
+
+
 def forum_topic_title(chat_name: str, pc_id: str) -> str:
     """Build a Telegram forum topic name (max 128 chars, single line)."""
     base = ' '.join((chat_name or '').split()).strip() or 'Chat'
