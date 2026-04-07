@@ -151,6 +151,58 @@ def _forum_general_key() -> RouteKey | None:
     return RouteKey(FORUM_CHAT_ID, None)
 
 
+def _purge_all_forum_thread_routes_for_cursor_chat(iid: str, pc_id: str) -> int:
+    """Remove every forum *thread* mirror for this Cursor composer (not General).
+
+    Used when a topic id is invalid so we do not retry other stale duplicate rows for the
+    same ``(instance_id, pc_id)``.
+    """
+    global last_sender_route
+    if FORUM_CHAT_ID is None:
+        return 0
+    n = 0
+    with mirrored_chats_lock:
+        for rk in list(mirrored_chats.keys()):
+            if rk.chat_id != FORUM_CHAT_ID or rk.message_thread_id is None:
+                continue
+            mc = mirrored_chats[rk]
+            if mc[0] == iid and mc[1] == pc_id:
+                del mirrored_chats[rk]
+                n += 1
+                if last_sender_route == rk:
+                    last_sender_route = None
+    return n
+
+
+def _dedupe_forum_thread_mirrors_by_cursor_chat() -> None:
+    """Keep one forum thread RouteKey per (instance_id, pc_id); drop duplicate restores."""
+    global last_sender_route
+    if FORUM_CHAT_ID is None:
+        return
+    culled = 0
+    with mirrored_chats_lock:
+        by_comp: dict[tuple[str, str], list[RouteKey]] = {}
+        for rk, mc in list(mirrored_chats.items()):
+            if rk.chat_id != FORUM_CHAT_ID or rk.message_thread_id is None:
+                continue
+            if len(mc) < 2:
+                continue
+            by_comp.setdefault((mc[0], mc[1]), []).append(rk)
+        for _key, rks in by_comp.items():
+            if len(rks) <= 1:
+                continue
+            keep = max(rks, key=lambda x: x.message_thread_id or 0)
+            for rk in rks:
+                if rk != keep:
+                    del mirrored_chats[rk]
+                    culled += 1
+                    if last_sender_route == rk:
+                        last_sender_route = None
+    if culled:
+        print(f'[forum] Deduped {culled} duplicate forum mirror(s) (same instance + pc_id)')
+        _persist_mirrored_routes()
+
+
 def _strip_general_mirror_for_chat_unsafe(iid: str, pc_id: str) -> None:
     """Remove General row if it points at this Cursor chat. Caller must hold ``mirrored_chats_lock``."""
     g = _forum_general_key()
@@ -476,13 +528,17 @@ def _recover_stale_forum_topic_after_failed_send(
             mapped = _forum_thread_remap.get((cid, tid_used))
         return mapped
 
+    m = _normalize_mirror_row(mc)
+    iid, pc_id, name, msg_fp = m
+    extra = _purge_all_forum_thread_routes_for_cursor_chat(iid, pc_id)
+    if extra:
+        print(f'[forum] Cleared {extra} other stale forum row(s) for same Cursor chat')
+
     _persist_mirrored_routes()
     global last_sender_route
     if last_sender_route == rk:
         last_sender_route = None
 
-    m = _normalize_mirror_row(mc)
-    iid, pc_id, name, msg_fp = m
     print(f'[forum] Topic deleted (thread {tid_used}); recreating for {name!r}  ({pc_id[:16]}…)')
     new_rk = _ensure_forum_topic_for_cursor_chat(iid, pc_id, name, msg_fp)
     new_tid = new_rk.message_thread_id if new_rk else None
@@ -1287,6 +1343,7 @@ def cdp_connect():
             if rk in mirrored_chats:
                 break
 
+    _dedupe_forum_thread_mirrors_by_cursor_chat()
     _prune_forum_general_route_if_redundant()
 
     if not active_instance_id:
@@ -2340,6 +2397,18 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             selectorForShot = bubbleSelector + ' .ui-shell-tool-call';
                         }
                     }
+                    // MCP / GitHub PR / external tools: .composer-mcp-tool-call-block (no data-click-ready)
+                    if (actionBtns.length === 0) {
+                        const mcpBlock = msg.querySelector('.composer-mcp-tool-call-block');
+                        if (mcpBlock) {
+                            const mcpBtns = mcpBlock.querySelectorAll('button.ui-button');
+                            if (mcpBtns.length > 0) {
+                                actionBtns = mcpBtns;
+                                buttonsSelector = bubbleSelector + ' .composer-mcp-tool-call-block button.ui-button';
+                                selectorForShot = bubbleSelector + ' .composer-mcp-tool-call-block';
+                            }
+                        }
+                    }
 
                     if (actionBtns.length > 0) {
                         const buttons = Array.from(actionBtns).map((btn, idx) => ({
@@ -2357,6 +2426,11 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                             if (summary) parts.push(summary.textContent.trim());
                             if (cmd) parts.push(cmd.textContent.trim().replace(/\\s+/g, ' '));
                             cleanText = parts.filter(Boolean).join(' — ') || 'Shell command pending';
+                        } else if (msg.querySelector('.composer-mcp-tool-call-block')) {
+                            const mcpBlock = msg.querySelector('.composer-mcp-tool-call-block');
+                            let t = mcpBlock.innerText.trim().replace(/\\s+/g, ' ');
+                            if (t.length > 2400) t = t.slice(0, 2400) + '…';
+                            cleanText = t || 'MCP / tool action pending';
                         } else {
                         const desc = msg.querySelector('.composer-tool-former-message');
                         // Extract text from specific DOM parts, ignoring control row (buttons)
@@ -2493,6 +2567,32 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                                 id: tid || ('gen:' + msgId + ':shell'),
                                 selector: bubbleSelector + ' .ui-shell-tool-call',
                                 buttons_selector: bubbleSelector + ' .ui-shell-tool-call--pending .ui-shell-tool-call__approval-row button.ui-button',
+                                buttons: buttons
+                            });
+                            return;
+                        }
+                    }
+                    // MCP block rendered inside AI markdown bubble (not data-message-kind=tool)
+                    const mcpInAi = msg.querySelector('.composer-mcp-tool-call-block');
+                    if (mcpInAi) {
+                        const mcpAiBtns = mcpInAi.querySelectorAll('button.ui-button');
+                        if (mcpAiBtns.length > 0) {
+                            const buttons = Array.from(mcpAiBtns).map((btn, idx) => ({
+                                label: btn.innerText.trim().replace(/\\s+/g, ' '),
+                                index: idx
+                            }));
+                            let t = mcpInAi.innerText.trim().replace(/\\s+/g, ' ');
+                            if (t.length > 2400) t = t.slice(0, 2400) + '…';
+                            const cleanMcp = t || 'MCP / tool action pending';
+                            const bubbleSel = '#bubble-' + bubbleSuffix;
+                            const nestedId = mcpInAi.closest('[data-tool-call-id]');
+                            const tidMcp = nestedId ? nestedId.getAttribute('data-tool-call-id') : '';
+                            sections.push({
+                                text: cleanMcp,
+                                type: 'confirmation',
+                                id: tidMcp || ('gen:' + msgId + ':mcpai'),
+                                selector: bubbleSel + ' .composer-mcp-tool-call-block',
+                                buttons_selector: bubbleSel + ' .composer-mcp-tool-call-block button.ui-button',
                                 buttons: buttons
                             });
                             return;
