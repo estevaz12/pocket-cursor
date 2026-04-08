@@ -45,10 +45,13 @@ from lib.telegram_routes import (
     RouteKey,
     canonical_outbound_route,
     composer_id_prefix_from_pc_id,
+    find_forum_route_for_pc,
+    forum_reconcile_target_route,
     forum_topic_title,
     fp_equiv,
     group_routes_by_mirror,
     is_risky_generic_chat_name,
+    last_sender_after_forum_thread_dedupe,
     load_routes_json,
     migrate_legacy_route_files,
     monitor_unscoped_turn_belongs_to_mirror,
@@ -93,6 +96,7 @@ CONTEXT_MONITOR = os.environ.get('CONTEXT_MONITOR', '').lower() in ('true', '1',
 
 # Command rules: auto-accept/deny Cursor tool confirmations based on allow/deny patterns
 COMMAND_RULES = os.environ.get('COMMAND_RULES', '').lower() in ('true', '1', 'yes')
+POCKET_CURSOR_DEBUG = os.environ.get('POCKET_CURSOR_DEBUG', '').lower() in ('true', '1', 'yes')
 
 # Owner lock: only respond to this Telegram user ID
 # Set in .env or auto-captured on first /start command
@@ -174,6 +178,7 @@ def _purge_all_forum_thread_routes_for_cursor_chat(iid: str, pc_id: str) -> int:
             if mc[0] == iid and mc[1] == pc_id:
                 del mirrored_chats[rk]
                 n += 1
+                # Intentionally clear (not retarget): purge invalid/stale rows for this composer.
                 if last_sender_route == rk:
                     last_sender_route = None
     return n
@@ -201,8 +206,9 @@ def _dedupe_forum_thread_mirrors_by_cursor_chat() -> None:
                 if rk != keep:
                     del mirrored_chats[rk]
                     culled += 1
-                    if last_sender_route == rk:
-                        last_sender_route = keep  # Point to surviving route, not None
+                    last_sender_route = last_sender_after_forum_thread_dedupe(
+                        last_sender_route, rk, keep
+                    )
     if culled:
         print(f'[forum] Deduped {culled} duplicate forum mirror(s) (same instance + pc_id)')
         _persist_mirrored_routes()
@@ -239,15 +245,16 @@ else:
 _remap_path = Path(__file__).parent / '.forum_thread_remap.json'
 if _remap_path.exists():
     try:
-        import json as _json_remap
-        _remap_raw = _json_remap.loads(_remap_path.read_text(encoding='utf-8'))
-        for k, v in _remap_raw.items():
-            cid_str, tid_str = k.split(':', 1)
-            _forum_thread_remap[(int(cid_str), int(tid_str))] = int(v)
-        if _forum_thread_remap:
-            print(f'[forum] Loaded {len(_forum_thread_remap)} thread remap(s) from disk')
-    except Exception:
-        pass
+        _remap_raw = json.loads(_remap_path.read_text(encoding='utf-8'))
+        if isinstance(_remap_raw, dict):
+            for k, v in _remap_raw.items():
+                cid_str, tid_str = str(k).split(':', 1)
+                _forum_thread_remap[(int(cid_str), int(tid_str))] = int(v)
+            if _forum_thread_remap:
+                print(f'[forum] Loaded {len(_forum_thread_remap)} thread remap(s) from disk')
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        if POCKET_CURSOR_DEBUG:
+            print(f'[forum] Could not load thread remap file: {e}')
 
 chat_id_lock = threading.Lock()
 muted_file = Path(__file__).parent / '.muted'
@@ -335,7 +342,8 @@ def _mirror_for_inbound(route: RouteKey) -> MirrorRow | None:
 
 _FORUM_TOPIC_UNBOUND = (
     'This forum topic is not linked to a Cursor chat yet. '
-    'Focus that agent tab in Cursor so the bridge can bind it, then send again.'
+    'Focus that agent tab in Cursor so the bridge can bind it, then send again. '
+    'Or open the agent from Telegram: /chats → tap the chat.'
 )
 
 
@@ -368,14 +376,14 @@ def _persist_mirrored_routes() -> None:
         save_routes_json(routes_file, bind)
         # Also persist thread remap for restart resilience
         try:
-            import json as _json
             with _forum_thread_remap_lock:
                 if _forum_thread_remap:
                     remap_path = Path(__file__).parent / '.forum_thread_remap.json'
                     remap_data = {f'{k[0]}:{k[1]}': v for k, v in _forum_thread_remap.items()}
-                    remap_path.write_text(_json.dumps(remap_data, indent=2) + '\n', encoding='utf-8')
-        except Exception:
-            pass
+                    remap_path.write_text(json.dumps(remap_data, indent=2) + '\n', encoding='utf-8')
+        except OSError as e:
+            if POCKET_CURSOR_DEBUG:
+                print(f'[forum] Could not persist thread remap: {e}')
     except OSError:
         pass
 
@@ -397,16 +405,7 @@ def _find_forum_route_for_pc(
     or workspace switches.
     """
     with mirrored_chats_lock:
-        same_instance: RouteKey | None = None
-        cross_instance: RouteKey | None = None
-        for rk, mc in mirrored_chats.items():
-            if rk.chat_id == forum_cid and rk.message_thread_id is not None and mc[1] == pc_id:
-                if mc[0] == iid:
-                    same_instance = rk
-                    break  # Strongest match - stop immediately
-                if cross_instance is None:
-                    cross_instance = rk
-        return same_instance or cross_instance
+        return find_forum_route_for_pc(mirrored_chats, forum_cid, iid, pc_id)
 
 
 def _migrate_mirrored_pc_id(iid: str, old_pc: str, new_pc: str, name: str) -> None:
@@ -516,7 +515,9 @@ def _ensure_forum_topic_for_cursor_chat(
                 and dup_rk.message_thread_id is not None
                 and mirrored_chats[dup_rk][1] == pc_id
             ):
-                print(f'[forum] Invariant: dropping dup thread {dup_rk.message_thread_id} for {pc_id[:16]}')
+                print(
+                    f'[forum] Invariant: dropping dup thread {dup_rk.message_thread_id} for {pc_id[:16]}'
+                )
                 del mirrored_chats[dup_rk]
     last_sender_route = rk
     _persist_mirrored_routes()
@@ -1209,7 +1210,9 @@ def _handle_chat_rename(iid, data):
             # Update ALL rows with matching pc_id (cross-instance)
             if mc[1] == pc_id:
                 m = _normalize_mirror_row(mc)
-                mirrored_chats[rk] = _mirror_row(m[0], pc_id, name, m[3])  # keep original instance_id
+                mirrored_chats[rk] = _mirror_row(
+                    m[0], pc_id, name, m[3]
+                )  # keep original instance_id
     _persist_mirrored_routes()
     if FORUM_CHAT_ID is not None:
         ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, None, chat_name=name)
@@ -1382,11 +1385,14 @@ def cdp_connect():
 
     _dedupe_forum_thread_mirrors_by_cursor_chat()
     _prune_forum_general_route_if_redundant()
-    # Log restored routes for debugging
-    with mirrored_chats_lock:
-        for rk, mc in mirrored_chats.items():
-            if rk.chat_id == (FORUM_CHAT_ID or 0) and rk.message_thread_id is not None:
-                print(f'[cdp] Forum route: thread {rk.message_thread_id}' + f' -> pc_id={mc[1][:16]}  "{mc[2]}"')
+    if POCKET_CURSOR_DEBUG and FORUM_CHAT_ID is not None:
+        with mirrored_chats_lock:
+            for rk, mc in mirrored_chats.items():
+                if rk.chat_id == FORUM_CHAT_ID and rk.message_thread_id is not None:
+                    print(
+                        f'[cdp] Forum route: thread {rk.message_thread_id}'
+                        + f' -> pc_id={mc[1][:16]}  "{mc[2]}"'
+                    )
 
     if not active_instance_id:
         active_instance_id = next(
@@ -2141,26 +2147,39 @@ def cursor_send_message(text, raw=False, mirrored=None):
         text = f'[{timestamp}] [Phone] {text}'
 
     global msg_id_counter
-    if mirrored:
-        cursor_switch_to_mirrored(mirrored)
-        iid, _, _ = mirrored
-        conn = instance_registry.get(iid, {}).get('ws') or active_conn()
-    else:
-        conn = active_conn()
-    t0 = time.time()
+    try:
+        if mirrored:
+            mm = _normalize_mirror_row(mirrored)
+            iid = mm[0]
+            if iid not in instance_registry:
+                return (
+                    'ERROR: Cursor workspace for this chat is not connected — '
+                    'open that project in Cursor or restart the bridge'
+                )
+            cursor_switch_to_mirrored(mirrored)
+            conn = instance_registry[iid]['ws']
+        else:
+            conn = active_conn()
+        if not conn:
+            return (
+                'ERROR: no Cursor CDP connection — launch Cursor with debugging enabled '
+                '(see README / start_cursor.py)'
+            )
 
-    with cdp_lock:
-        # 1. Focus editor
-        with msg_id_lock:
-            msg_id_counter += 1
-            mid = msg_id_counter
-        conn.send(
-            json.dumps(
-                {
-                    'id': mid,
-                    'method': 'Runtime.evaluate',
-                    'params': {
-                        'expression': """
+        t0 = time.time()
+
+        with cdp_lock:
+            # 1. Focus editor
+            with msg_id_lock:
+                msg_id_counter += 1
+                mid = msg_id_counter
+            conn.send(
+                json.dumps(
+                    {
+                        'id': mid,
+                        'method': 'Runtime.evaluate',
+                        'params': {
+                            'expression': """
                 (function() {
                     let editor = document.querySelector('.aislash-editor-input');
                     if (!editor) {
@@ -2181,36 +2200,38 @@ def cursor_send_message(text, raw=False, mirrored=None):
                     return 'OK';
                 })();
             """,
-                        'returnByValue': True,
-                    },
-                }
+                            'returnByValue': True,
+                        },
+                    }
+                )
             )
-        )
-        focus_result = json.loads(conn.recv())
-        focus_val = focus_result.get('result', {}).get('result', {}).get('value')
-        if focus_val != 'OK':
-            return focus_val
-        t1 = time.time()
+            focus_result = json.loads(conn.recv())
+            focus_val = focus_result.get('result', {}).get('result', {}).get('value')
+            if focus_val != 'OK':
+                return focus_val
+            t1 = time.time()
 
-        # 2. Insert text at end (still holding lock)
-        with msg_id_lock:
-            msg_id_counter += 1
-            mid = msg_id_counter
-        conn.send(json.dumps({'id': mid, 'method': 'Input.insertText', 'params': {'text': text}}))
-        json.loads(conn.recv())
-        t2 = time.time()
+            # 2. Insert text at end (still holding lock)
+            with msg_id_lock:
+                msg_id_counter += 1
+                mid = msg_id_counter
+            conn.send(
+                json.dumps({'id': mid, 'method': 'Input.insertText', 'params': {'text': text}})
+            )
+            json.loads(conn.recv())
+            t2 = time.time()
 
-        # 3. Verify + click send (still holding lock)
-        with msg_id_lock:
-            msg_id_counter += 1
-            mid = msg_id_counter
-        conn.send(
-            json.dumps(
-                {
-                    'id': mid,
-                    'method': 'Runtime.evaluate',
-                    'params': {
-                        'expression': """
+            # 3. Verify + click send (still holding lock)
+            with msg_id_lock:
+                msg_id_counter += 1
+                mid = msg_id_counter
+            conn.send(
+                json.dumps(
+                    {
+                        'id': mid,
+                        'method': 'Runtime.evaluate',
+                        'params': {
+                            'expression': """
                 (function() {
                     let editor = document.querySelector('.aislash-editor-input');
                     if (!editor) {
@@ -2236,19 +2257,23 @@ def cursor_send_message(text, raw=False, mirrored=None):
                     return 'ERROR: no send button';
                 })();
             """,
-                        'returnByValue': True,
-                    },
-                }
+                            'returnByValue': True,
+                        },
+                    }
+                )
             )
-        )
-        send_result = json.loads(conn.recv())
-        result = send_result.get('result', {}).get('result', {}).get('value')
+            send_result = json.loads(conn.recv())
+            result = send_result.get('result', {}).get('result', {}).get('value')
 
-    t3 = time.time()
-    print(
-        f'[sender] Timing: focus={int((t1 - t0) * 1000)}ms insert={int((t2 - t1) * 1000)}ms verify+send={int((t3 - t2) * 1000)}ms total={int((t3 - t0) * 1000)}ms'
-    )
-    return result
+        t3 = time.time()
+        print(
+            f'[sender] Timing: focus={int((t1 - t0) * 1000)}ms insert={int((t2 - t1) * 1000)}ms verify+send={int((t3 - t2) * 1000)}ms total={int((t3 - t0) * 1000)}ms'
+        )
+        return result
+    except Exception as e:
+        err = f'ERROR: {type(e).__name__}: {e}'
+        print(f'[sender] cursor_send_message: {err}')
+        return err
 
 
 def cursor_new_chat():
@@ -3210,7 +3235,13 @@ def sender_thread():
                         # If there's a caption, also insert it as text
                         if caption:
                             time.sleep(0.5)
-                            cursor_send_message(caption, mirrored=_mc)
+                            cap_res = cursor_send_message(caption, mirrored=_mc)
+                            if cap_res is None or 'ERROR' in str(cap_res):
+                                tg_send(
+                                    cid,
+                                    f'Failed (caption): {cap_res or "no response"}',
+                                    message_thread_id=thr,
+                                )
                         else:
                             # Just click send after the image
                             time.sleep(0.5)
@@ -3251,6 +3282,12 @@ def sender_thread():
                                 f'[Voice] {transcription}', mirrored=_mirror_for_inbound(route)
                             )
                             print(f'[sender] -> Cursor: {result}')
+                            if result is None or 'ERROR' in str(result):
+                                tg_send(
+                                    cid,
+                                    f'Failed: {result or "no response from Cursor"}',
+                                    message_thread_id=thr,
+                                )
                         else:
                             tg_send(
                                 cid,
@@ -3395,8 +3432,10 @@ def sender_thread():
                 result = cursor_send_message(text, mirrored=_mirror_for_inbound(route))
                 print(f'[sender] -> Cursor: {result}')
 
-                if 'ERROR' in str(result):
-                    tg_send(cid, f'Failed: {result}', message_thread_id=thr)
+                if result is None or 'ERROR' in str(result):
+                    tg_send(
+                        cid, f'Failed: {result or "no response from Cursor"}', message_thread_id=thr
+                    )
 
         except Exception as e:
             print(f'[sender] Error: {e}')
@@ -3427,9 +3466,7 @@ def _monitor_globally_scoped_turn_matches_mirror(turn: dict[str, Any], mc: Any) 
     """See ``monitor_unscoped_turn_belongs_to_mirror``."""
     if not mc or len(mc) < 3:
         return True
-    return monitor_unscoped_turn_belongs_to_mirror(
-        turn.get('conv'), mc[2], mc[1]
-    )
+    return monitor_unscoped_turn_belongs_to_mirror(turn.get('conv'), mc[2], mc[1])
 
 
 def _forwarded_id_seed_from_sections(sections):
@@ -3493,14 +3530,12 @@ def _reconcile_mirrored_chat_from_dom():
     # -- Forum mode: update last_sender_route to match active DOM tab --
     if FORUM_CHAT_ID is not None:
         with mirrored_chats_lock:
-            target_rk = None
-            for k, row in mirrored_chats.items():
-                if k.chat_id == FORUM_CHAT_ID and row[1] == apc:
-                    target_rk = k
-                    break
+            target_rk = forum_reconcile_target_route(mirrored_chats, FORUM_CHAT_ID, apc)
         if target_rk is not None:
             last_sender_route = target_rk
-            print(f'[monitor] Forum reconcile: last_sender_route -> thread {target_rk.message_thread_id} (pc_id matched DOM)')
+            print(
+                f'[monitor] Forum reconcile: last_sender_route -> thread {target_rk.message_thread_id} (pc_id matched DOM)'
+            )
             return True
         # Active DOM tab has no forum topic yet -- nothing to reconcile
         return False
@@ -4605,7 +4640,10 @@ def _check_single_instance():
             old_pid = int(_lock_file.read_text().strip())
             if _is_process_alive(old_pid):
                 print(f'ERROR: Bridge is already running (PID {old_pid}).')
-                print(f'Kill it first: taskkill /PID {old_pid} /F')
+                if sys.platform == 'win32':
+                    print(f'Kill it first: taskkill /PID {old_pid} /F')
+                else:
+                    print(f'Kill it first: kill {old_pid}')
                 sys.exit(1)
             # Process is dead, stale lock file — proceed
         except (ValueError, OSError):

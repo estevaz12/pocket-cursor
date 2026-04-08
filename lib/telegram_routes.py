@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 ROUTES_FILE_VERSION = 1
 
@@ -91,6 +91,63 @@ def save_routes_json(path: Path, routes: Mapping[RouteKey, Mapping[str, Any]]) -
         'routes': {rk.to_storage_key(): dict(route_binding_to_json(v)) for rk, v in routes.items()},
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+
+
+def find_forum_route_for_pc(
+    mirrored_chats: Mapping[RouteKey, Any],
+    forum_cid: int,
+    instance_id: str,
+    pc_id: str,
+) -> RouteKey | None:
+    """Return the Telegram forum thread route for ``pc_id`` if present.
+
+    Considers only threaded forum routes (``message_thread_id is not None``).
+    Prefers a mirror row whose ``instance_id`` matches; otherwise first cross-instance match.
+    """
+    same_instance: RouteKey | None = None
+    cross_instance: RouteKey | None = None
+    for rk, mc in mirrored_chats.items():
+        if rk.chat_id != forum_cid or rk.message_thread_id is None:
+            continue
+        if not isinstance(mc, (tuple, list)) or len(mc) < 2:
+            continue
+        if mc[1] != pc_id:
+            continue
+        if mc[0] == instance_id:
+            same_instance = rk
+            break
+        if cross_instance is None:
+            cross_instance = rk
+    return same_instance or cross_instance
+
+
+def forum_reconcile_target_route(
+    mirrored_chats: Mapping[RouteKey, Any],
+    forum_chat_id: int,
+    active_pc_id: str | None,
+) -> RouteKey | None:
+    """Forum-mode DOM reconcile: first route in the forum whose mirror ``pc_id`` matches."""
+    if not active_pc_id:
+        return None
+    for k, row in mirrored_chats.items():
+        if k.chat_id != forum_chat_id:
+            continue
+        if not isinstance(row, (tuple, list)) or len(row) < 2:
+            continue
+        if row[1] == active_pc_id:
+            return k
+    return None
+
+
+def last_sender_after_forum_thread_dedupe(
+    last_sender: RouteKey | None,
+    removed_route: RouteKey,
+    surviving_route: RouteKey,
+) -> RouteKey | None:
+    """When removing a duplicate forum thread, repoint ``last_sender`` to the survivor."""
+    if last_sender == removed_route:
+        return surviving_route
+    return last_sender
 
 
 def canonical_outbound_route(

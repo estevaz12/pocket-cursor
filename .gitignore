@@ -8,7 +8,12 @@
 .muted
 .active_chat
 .telegram_routes.json
+.forum_thread_remap.json
 .context_pcts
+
+# Editor / scratch backups
+*.bak
+test_out.txt
 
 # Journals (personal to each conversation, except example)
 .pocket-cursor/journals/*
