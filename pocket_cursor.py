@@ -1596,17 +1596,19 @@ def cdp_screenshot():
     return cdp_screenshot_on(active_conn())
 
 
-def cdp_hover_file_path(filename_selector):
+def cdp_hover_file_path(filename_selector, conn=None):
     """Hover over a filename element in the chat to read the full path from its tooltip.
 
     Uses CDP Input.dispatchMouseEvent (synthetic, doesn't move the real cursor).
     Tooltip format: 'workspace • relative\\path\\file.ext'
     Returns the relative path (e.g., 'scripts/food-tracker/journal.md') or None.
+
+    Pass ``conn`` for the Cursor window that owns the chat (monitor uses mirrored instance WS).
     """
     try:
-        conn = active_conn()
+        c = conn or active_conn()
         pos = cdp_eval_on(
-            conn,
+            c,
             f"""
             (() => {{
                 const el = document.querySelector('{filename_selector}');
@@ -1622,7 +1624,7 @@ def cdp_hover_file_path(filename_selector):
 
         # Hover over filename to trigger tooltip
         _cdp_cmd(
-            conn,
+            c,
             'Input.dispatchMouseEvent',
             {'type': 'mouseMoved', 'x': int(box['x']), 'y': int(box['y'])},
         )
@@ -1632,7 +1634,7 @@ def cdp_hover_file_path(filename_selector):
         deadline = time.time() + 1.0
         while time.time() < deadline:
             tooltip = cdp_eval_on(
-                conn,
+                c,
                 """
                 (() => {
                     const hover = document.querySelector('.workbench-hover-container .hover-contents');
@@ -1645,7 +1647,7 @@ def cdp_hover_file_path(filename_selector):
             time.sleep(0.05)
 
         # Move mouse away to dismiss tooltip
-        _cdp_cmd(conn, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': 0, 'y': 0})
+        _cdp_cmd(c, 'Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': 0, 'y': 0})
         time.sleep(0.1)
 
         if not tooltip:
@@ -1660,16 +1662,21 @@ def cdp_hover_file_path(filename_selector):
         return None
 
 
-def cdp_try_expand(selector):
+def cdp_try_expand(selector, conn=None):
     """Expand a collapsed element by clicking its expand chevron (if any).
 
     Works for file edits, terminal commands, and any tool-call container
     that has a .composer-message-codeblock-expand button.
     Walks up from the selector to the bubble and looks for the button there.
     Returns True if expanded, False otherwise.
+
+    Pass ``conn`` when the target UI is on a non-active Cursor window.
     """
     try:
-        result = cdp_eval(f"""
+        c = conn or active_conn()
+        result = cdp_eval_on(
+            c,
+            f"""
             (() => {{
                 const el = document.querySelector('{selector}');
                 if (!el) return 'no_el';
@@ -1681,7 +1688,8 @@ def cdp_try_expand(selector):
                 btn.click();
                 return 'expanded';
             }})();
-        """)
+        """,
+        )
         if result == 'expanded':
             time.sleep(0.5)
             return True
@@ -1693,10 +1701,13 @@ def cdp_try_expand(selector):
         return False
 
 
-def cdp_try_collapse(selector):
+def cdp_try_collapse(selector, conn=None):
     """Collapse an expanded element back by clicking its chevron-up button."""
     try:
-        cdp_eval(f"""
+        c = conn or active_conn()
+        cdp_eval_on(
+            c,
+            f"""
             (() => {{
                 const el = document.querySelector('{selector}');
                 if (!el) return 'skip';
@@ -1707,27 +1718,35 @@ def cdp_try_collapse(selector):
                 if (icon && icon.classList.contains('codicon-chevron-up')) btn.click();
                 return 'ok';
             }})();
-        """)
+        """,
+        )
         time.sleep(0.3)
     except Exception as e:
         print(f'[screenshot] try_collapse error: {e}')
 
 
-def cdp_screenshot_element(selector):
+def cdp_screenshot_element(selector, conn=None):
     """Screenshot a specific DOM element by CSS selector. Returns PNG bytes or None.
 
     Takes a full screenshot (which works reliably), then crops the element
     region using Pillow. Sidesteps CDP clip coordinate/DPR issues entirely.
+
+    Pass ``conn`` for the WebSocket of the Cursor window that contains the element
+    (the monitor must use the mirrored route's instance, not only ``active_conn()``).
     """
+    c = conn or active_conn()
     # Step 1: Scroll the element into view
-    found = cdp_eval(f"""
+    found = cdp_eval_on(
+        c,
+        f"""
         (function() {{
             const el = document.querySelector('{selector}');
             if (!el) return null;
             el.scrollIntoView({{ block: 'center', behavior: 'instant' }});
             return 'ok';
         }})();
-    """)
+    """,
+    )
     if not found:
         print(f'[screenshot] Element NOT found: {selector}')
         return None
@@ -1736,7 +1755,9 @@ def cdp_screenshot_element(selector):
     time.sleep(0.5)
 
     # Step 3: Get bounding rect + viewport size
-    rect = cdp_eval(f"""
+    rect = cdp_eval_on(
+        c,
+        f"""
         (function() {{
             const container = document.querySelector('{selector}');
             if (!container) return null;
@@ -1752,7 +1773,8 @@ def cdp_screenshot_element(selector):
                 viewport_h: window.innerHeight
             }});
         }})();
-    """)
+    """,
+    )
     if not rect:
         return None
     try:
@@ -1764,7 +1786,7 @@ def cdp_screenshot_element(selector):
         return None
 
     # Step 4: Take full screenshot
-    full_png = cdp_screenshot()
+    full_png = cdp_screenshot_on(c)
     if not full_png:
         print('[screenshot] Full screenshot failed')
         return None
@@ -3957,7 +3979,7 @@ def monitor_thread():
                                 if accept_idx is not None:
                                     # Screenshot BEFORE click (click changes DOM)
                                     png = (
-                                        cdp_screenshot_element(sec_selector)
+                                        cdp_screenshot_element(sec_selector, conn=mc_conn)
                                         if sec_selector
                                         else None
                                     )
@@ -4006,7 +4028,7 @@ def monitor_thread():
                                 tg_typing(cid, message_thread_id=thr)
                                 png = None
                                 if sec_selector:
-                                    png = cdp_screenshot_element(sec_selector)
+                                    png = cdp_screenshot_element(sec_selector, conn=mc_conn)
                                 keyboard = []
                                 for btn in buttons:
                                     cb_line = f'btn_{btn["index"]}:{cb_key}'
@@ -4058,19 +4080,20 @@ def monitor_thread():
                                         else None
                                     )
                                     if fn_sel:
-                                        file_path = cdp_hover_file_path(fn_sel)
+                                        file_path = cdp_hover_file_path(fn_sel, conn=mc_conn)
                                         if file_path:
                                             print(f'[monitor] File path: {file_path}')
                                 png = None
                                 expanded = False
                                 if sec_selector:
-                                    expanded = cdp_try_expand(sec_selector)
-                                    png = cdp_screenshot_element(sec_selector)
+                                    expanded = cdp_try_expand(sec_selector, conn=mc_conn)
+                                    png = cdp_screenshot_element(sec_selector, conn=mc_conn)
                                     if expanded:
-                                        cdp_try_collapse(sec_selector)
+                                        cdp_try_collapse(sec_selector, conn=mc_conn)
                                 if not png and sec_type == 'table':
                                     png = cdp_screenshot_element(
-                                        '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container'
+                                        '.composer-human-ai-pair-container:last-child [data-message-role="ai"] .markdown-table-container',
+                                        conn=mc_conn,
                                     )
                                 label = {
                                     'table': 'TABLE',
