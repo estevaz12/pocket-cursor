@@ -62,7 +62,13 @@ def load_routes_json(path: Path) -> dict[RouteKey, dict[str, Any]]:
     """Load `.telegram_routes.json`. Returns route -> {workspace, pc_id, chat_name}."""
     if not path.exists():
         return {}
-    raw = json.loads(path.read_text(encoding='utf-8'))
+    try:
+        text = path.read_text(encoding='utf-8').strip()
+        if not text:
+            return {}
+        raw = json.loads(text)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
     if not isinstance(raw, dict):
         return {}
     out: dict[RouteKey, dict[str, Any]] = {}
