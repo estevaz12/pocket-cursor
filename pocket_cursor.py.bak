@@ -202,7 +202,7 @@ def _dedupe_forum_thread_mirrors_by_cursor_chat() -> None:
                     del mirrored_chats[rk]
                     culled += 1
                     if last_sender_route == rk:
-                        last_sender_route = keep  # Point to surviving route, not None
+                        last_sender_route = None
     if culled:
         print(f'[forum] Deduped {culled} duplicate forum mirror(s) (same instance + pc_id)')
         _persist_mirrored_routes()
@@ -235,20 +235,6 @@ else:
             save_routes_json(routes_file, _route_bindings_initial)
         except OSError:
             pass
-# Load persisted forum thread remap
-_remap_path = Path(__file__).parent / '.forum_thread_remap.json'
-if _remap_path.exists():
-    try:
-        import json as _json_remap
-        _remap_raw = _json_remap.loads(_remap_path.read_text(encoding='utf-8'))
-        for k, v in _remap_raw.items():
-            cid_str, tid_str = k.split(':', 1)
-            _forum_thread_remap[(int(cid_str), int(tid_str))] = int(v)
-        if _forum_thread_remap:
-            print(f'[forum] Loaded {len(_forum_thread_remap)} thread remap(s) from disk')
-    except Exception:
-        pass
-
 chat_id_lock = threading.Lock()
 muted_file = Path(__file__).parent / '.muted'
 muted = muted_file.exists()  # Persisted across restarts
@@ -366,16 +352,6 @@ def _persist_mirrored_routes() -> None:
                     row['msg_id'] = msg_fp
                 bind[rk] = row
         save_routes_json(routes_file, bind)
-        # Also persist thread remap for restart resilience
-        try:
-            import json as _json
-            with _forum_thread_remap_lock:
-                if _forum_thread_remap:
-                    remap_path = Path(__file__).parent / '.forum_thread_remap.json'
-                    remap_data = {f'{k[0]}:{k[1]}': v for k, v in _forum_thread_remap.items()}
-                    remap_path.write_text(_json.dumps(remap_data, indent=2) + '\n', encoding='utf-8')
-        except Exception:
-            pass
     except OSError:
         pass
 
@@ -390,23 +366,45 @@ def _find_forum_route_for_pc(
 ) -> RouteKey | None:
     """Return the Telegram route for this Cursor chat in the forum, if any.
 
-    Matching is **pc_id-only**: exact ``pc_id`` match is the sole lookup key.
-    Prefers same-instance match; falls back to cross-instance same ``pc_id``.
-    Fingerprint and chat_name are NOT used for routing (only for display/logging).
-    This prevents topic duplication caused by fingerprint divergence across restarts
-    or workspace switches.
+    Matching is **id-first**: ``(instance_id, pc_id)``, cross-window same ``pc_id``,
+    then conversation fingerprint (``fp_equiv`` tolerant). If several threads share the
+    same fingerprint, ``chat_name`` disambiguates when it matches exactly one row.
     """
+    fp = _norm_msg_fp(msg_fingerprint)
     with mirrored_chats_lock:
-        same_instance: RouteKey | None = None
-        cross_instance: RouteKey | None = None
+        fallback: RouteKey | None = None
         for rk, mc in mirrored_chats.items():
             if rk.chat_id == forum_cid and rk.message_thread_id is not None and mc[1] == pc_id:
                 if mc[0] == iid:
-                    same_instance = rk
-                    break  # Strongest match - stop immediately
-                if cross_instance is None:
-                    cross_instance = rk
-        return same_instance or cross_instance
+                    return rk
+                fallback = rk
+        if fallback is not None:
+            return fallback
+        if fp:
+            msg_hits: list[RouteKey] = []
+            for rk, mc in mirrored_chats.items():
+                m = _normalize_mirror_row(mc)
+                if (
+                    rk.chat_id == forum_cid
+                    and rk.message_thread_id is not None
+                    and m[0] == iid
+                    and m[3]
+                    and fp_equiv(m[3], fp)
+                ):
+                    msg_hits.append(rk)
+            if len(msg_hits) == 1:
+                return msg_hits[0]
+            if len(msg_hits) > 1 and chat_name:
+                want = norm_chat_name_for_match(chat_name)
+                if want:
+                    narrowed = [
+                        rk
+                        for rk in msg_hits
+                        if norm_chat_name_for_match(mirrored_chats[rk][2]) == want
+                    ]
+                    if len(narrowed) == 1:
+                        return narrowed[0]
+        return None
 
 
 def _migrate_mirrored_pc_id(iid: str, old_pc: str, new_pc: str, name: str) -> None:
@@ -508,16 +506,6 @@ def _ensure_forum_topic_for_cursor_chat(
     with mirrored_chats_lock:
         mirrored_chats[rk] = _mirror_row(iid, pc_id, name, fp)
         _strip_general_mirror_for_chat_unsafe(iid, pc_id)
-        # Invariant: at most one forum thread per pc_id.  Drop any stale duplicates.
-        for dup_rk in list(mirrored_chats.keys()):
-            if (
-                dup_rk != rk
-                and dup_rk.chat_id == FORUM_CHAT_ID
-                and dup_rk.message_thread_id is not None
-                and mirrored_chats[dup_rk][1] == pc_id
-            ):
-                print(f'[forum] Invariant: dropping dup thread {dup_rk.message_thread_id} for {pc_id[:16]}')
-                del mirrored_chats[dup_rk]
     last_sender_route = rk
     _persist_mirrored_routes()
     print(f'[forum] Topic for {name!r} → thread_id={tid}')
@@ -579,7 +567,6 @@ def _recover_stale_forum_topic_after_failed_send(
             if len(_forum_thread_remap) > 128:
                 for k in list(_forum_thread_remap)[:32]:
                     _forum_thread_remap.pop(k, None)
-        _persist_mirrored_routes()  # Save remap to disk for restart resilience
     return new_tid
 
 
@@ -1194,11 +1181,7 @@ def _handle_chat_switch(iid, data):
 
 
 def _handle_chat_rename(iid, data):
-    """Called by chat listener thread when active chat's name changes.
-
-    Updates ALL mirror rows matching this pc_id -- including cross-instance
-    rows -- so the monitor's name-based filter never skips forwarding
-    due to a stale chat_name."""
+    """Called by chat listener thread when active chat's name changes."""
     global mirrored_chats
     pc_id = data.get('pc_id', '')
     name = data.get('name', '')
@@ -1206,10 +1189,9 @@ def _handle_chat_rename(iid, data):
         return
     with mirrored_chats_lock:
         for rk, mc in list(mirrored_chats.items()):
-            # Update ALL rows with matching pc_id (cross-instance)
-            if mc[1] == pc_id:
+            if mc[0] == iid and mc[1] == pc_id:
                 m = _normalize_mirror_row(mc)
-                mirrored_chats[rk] = _mirror_row(m[0], pc_id, name, m[3])  # keep original instance_id
+                mirrored_chats[rk] = _mirror_row(iid, pc_id, name, m[3])
     _persist_mirrored_routes()
     if FORUM_CHAT_ID is not None:
         ex = _find_forum_route_for_pc(FORUM_CHAT_ID, iid, pc_id, None, chat_name=name)
@@ -1382,11 +1364,6 @@ def cdp_connect():
 
     _dedupe_forum_thread_mirrors_by_cursor_chat()
     _prune_forum_general_route_if_redundant()
-    # Log restored routes for debugging
-    with mirrored_chats_lock:
-        for rk, mc in mirrored_chats.items():
-            if rk.chat_id == (FORUM_CHAT_ID or 0) and rk.message_thread_id is not None:
-                print(f'[cdp] Forum route: thread {rk.message_thread_id}' + f' -> pc_id={mc[1][:16]}  "{mc[2]}"')
 
     if not active_instance_id:
         active_instance_id = next(
@@ -3447,17 +3424,8 @@ def _forwarded_id_seed_from_sections(sections):
 
 
 def _reconcile_mirrored_chat_from_dom():
-    """Sync last_sender_route with the DOM active tab.
-
-    In **forum mode** routes are stable bindings (one thread per Cursor chat).
-    We must NOT rebind a route's pc_id -- that would break the mapping and cause
-    wrong forwarding.  Instead, find the route whose pc_id matches the active
-    DOM tab and point ``last_sender_route`` there.
-
-    In **non-forum mode** (single DM), rebinding the sole route to the active
-    tab is the correct behaviour (legacy path, unchanged).
-    """
-    global mirrored_chats, last_sender_route
+    """If DOM active tab != mirror for last Telegram route, sync (fast tab switches)."""
+    global mirrored_chats
     rk = _preferred_telegram_route()
     if rk is None:
         return False
@@ -3488,24 +3456,7 @@ def _reconcile_mirrored_chat_from_dom():
         active = active_rows[0]
     apc = active.get('pc_id')
     if not apc or apc == pc_id:
-        return False  # Already in sync
-
-    # -- Forum mode: update last_sender_route to match active DOM tab --
-    if FORUM_CHAT_ID is not None:
-        with mirrored_chats_lock:
-            target_rk = None
-            for k, row in mirrored_chats.items():
-                if k.chat_id == FORUM_CHAT_ID and row[1] == apc:
-                    target_rk = k
-                    break
-        if target_rk is not None:
-            last_sender_route = target_rk
-            print(f'[monitor] Forum reconcile: last_sender_route -> thread {target_rk.message_thread_id} (pc_id matched DOM)')
-            return True
-        # Active DOM tab has no forum topic yet -- nothing to reconcile
         return False
-
-    # -- Non-forum mode: rebind the single route to the active tab (legacy) --
     new_name = (active.get('name') or '').strip() or name
     fp = _norm_msg_fp(active.get('msg_id')) or old_fp
     with mirrored_chats_lock:
@@ -4465,10 +4416,6 @@ def overview_thread():
                 if len(rename_digest) > 35:
                     lines.append(f'… +{len(rename_digest) - 35} more')
                 _tg_notify_all_routes('💬 Renamed this scan:\n' + '\n'.join(lines))
-
-            # Periodic invariant: dedupe forum threads (catches accumulated drift)
-            if FORUM_CHAT_ID is not None and _scan_cycle % 10 == 0:
-                _dedupe_forum_thread_mirrors_by_cursor_chat()
 
             if scan_summary:
                 parts = '  '.join(f'{ws} ({n})' for ws, n in scan_summary.items())
