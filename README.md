@@ -23,15 +23,16 @@ PocketCursor keeps them going. It connects your running Cursor to Telegram on yo
 
 ### Commands
 
-| Command       | Description                                                |
-| ------------- | ---------------------------------------------------------- |
-| `/newchat`    | Start a fresh conversation                                 |
-| `/chats`      | Show your open chats across all workspaces (tap to switch) |
-| `/pause`      | Mute forwarding                                            |
-| `/play`       | Resume forwarding                                          |
-| `/screenshot` | Screenshot your Cursor window                              |
-| `/unpair`     | Disconnect this device                                     |
-| `/start`      | Show status and commands                                   |
+| Command       | Description                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `/newchat`    | Start a fresh conversation                                                                                       |
+| `/chats`      | Show your open chats across all workspaces (tap to switch)                                                       |
+| `/mode`       | Set Cursor agent mode: `/mode agent`, `plan`, `ask`, or `debug` (shorthand: `/agent`, `/plan`, `/ask`, `/debug`) |
+| `/pause`      | Mute forwarding                                                                                                  |
+| `/play`       | Resume forwarding                                                                                                |
+| `/screenshot` | Screenshot your Cursor window                                                                                    |
+| `/unpair`     | Disconnect this device                                                                                           |
+| `/start`      | Show status and commands                                                                                         |
 
 ### Under the hood
 

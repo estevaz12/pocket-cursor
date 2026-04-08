@@ -879,11 +879,15 @@ def tg_send_photo_bytes_with_keyboard(
 POCKET_CURSOR_COMMANDS = [
     {'command': 'newchat', 'description': 'Start a new chat in Cursor'},
     {'command': 'chats', 'description': 'Show all chats across instances'},
+    {'command': 'mode', 'description': 'Set Cursor agent mode: /mode agent|plan|ask|debug'},
     {'command': 'pause', 'description': 'Pause Cursor to Telegram forwarding'},
     {'command': 'play', 'description': 'Resume forwarding'},
     {'command': 'screenshot', 'description': 'Screenshot your Cursor window'},
     {'command': 'unpair', 'description': 'Disconnect this device'},
 ]
+
+
+CURSOR_AGENT_MODES = frozenset({'agent', 'plan', 'ask', 'debug'})
 
 
 def tg_commands_need_update():
@@ -2313,6 +2317,213 @@ def cursor_new_chat():
     """)
 
 
+_CURSOR_AGENT_MODE_PICK_JS = r"""
+(function(want) {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    want = norm(want);
+    const valid = { agent: 1, plan: 1, ask: 1, debug: 1 };
+    if (!valid[want]) return 'ERROR:bad_mode';
+
+    function matches(rowText) {
+        const t = norm(rowText);
+        if (t === want) return true;
+        if (t.startsWith(want + ' ') || t.startsWith(want + '\n')) return true;
+        return false;
+    }
+
+    const selectors = [
+        '.quick-input-widget .monaco-list-row',
+        '.monaco-list:not(.hidden) .monaco-list-row',
+        '[role="listbox"] [role="option"]',
+        '[role="menu"] [role="menuitem"]',
+        '.action-widget .monaco-list-row',
+        '.context-view .monaco-list-row',
+    ];
+    for (const sel of selectors) {
+        for (const row of document.querySelectorAll(sel)) {
+            if (!row.offsetParent) continue;
+            const t = row.textContent || '';
+            if (!matches(t)) continue;
+            const clickable = row.querySelector('.monaco-icon-label') || row;
+            clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            row.click();
+            return 'OK:pick';
+        }
+    }
+    return 'NO_MATCH';
+})(__WANT__)
+"""
+
+
+_CURSOR_AGENT_MODE_OPEN_JS = r"""
+(function() {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    const tryClick = (el) => {
+        if (!el || !el.offsetParent) return false;
+        el.click();
+        return true;
+    };
+
+    // Cursor 2025+: Agent/Plan/Ask/Debug lives in .composer-unified-dropdown (div, not aria-haspopup button).
+    let unified = null;
+    for (const ed of document.querySelectorAll('.aislash-editor-input')) {
+        if (!ed.offsetParent) continue;
+        const bar = ed.closest('.composer-bar');
+        if (!bar) continue;
+        const dd = bar.querySelector('.composer-unified-dropdown');
+        if (dd && dd.offsetParent) {
+            unified = dd;
+            break;
+        }
+    }
+    if (!unified) {
+        for (const dd of document.querySelectorAll('.composer-unified-dropdown')) {
+            if (dd.offsetParent) {
+                unified = dd;
+                break;
+            }
+        }
+    }
+    if (unified && tryClick(unified)) return 'OPENED:composer-unified-dropdown';
+
+    for (const b of document.querySelectorAll('button[aria-haspopup="listbox"], button[aria-haspopup="menu"], [role="combobox"]')) {
+        const al = norm(b.getAttribute('aria-label') || '');
+        if ((al.includes('mode') || al.includes('agent') || al.includes('chat mode')) && tryClick(b)) {
+            return 'OPENED:combobox';
+        }
+    }
+
+    const sendWrap = document.querySelector('.send-with-mode');
+    if (sendWrap) {
+        let p = sendWrap.parentElement;
+        for (let i = 0; i < 10 && p; i++, p = p.parentElement) {
+            for (const b of p.querySelectorAll('button, [role="button"]')) {
+                const al = norm(b.getAttribute('aria-label') || '');
+                if (al.includes('mode') && tryClick(b)) return 'OPENED:near-send-aria';
+                const chev = b.querySelector('.codicon-chevron-down, .codicon-triangle-down');
+                if (chev && b.textContent && b.textContent.trim().length < 24 && tryClick(b)) {
+                    return 'OPENED:near-send-chevron';
+                }
+            }
+        }
+    }
+    return 'NO_OPEN';
+})()
+"""
+
+
+def _cdp_focus_aislash_editor(conn) -> str:
+    return str(
+        cdp_eval_on(
+            conn,
+            """
+        (function() {
+            let editor = document.querySelector('.aislash-editor-input');
+            if (!editor) {
+                const all = document.querySelectorAll('[data-lexical-editor="true"]');
+                for (const ed of all) {
+                    if (ed.contentEditable === 'true') { editor = ed; break; }
+                }
+            }
+            if (!editor) return 'ERROR: no composer input';
+            editor.focus();
+            editor.click();
+            return 'OK';
+        })();
+    """,
+        )
+    )
+
+
+def _cdp_agent_mode_keyboard_picker(conn) -> str:
+    """Dispatch Ctrl+. (Windows/Linux) or Cmd+. (macOS) on the window — Cursor's mode shortcut."""
+    is_mac = sys.platform == 'darwin'
+    js = f"""
+        (function() {{
+            const ed = document.querySelector('.aislash-editor-input')
+                || document.querySelector('[data-lexical-editor="true"]');
+            if (ed) {{ ed.focus(); }}
+            const w = window;
+            const down = new KeyboardEvent('keydown', {{
+                key: '.',
+                code: 'Period',
+                bubbles: true,
+                cancelable: true,
+                {'metaKey: true' if is_mac else 'ctrlKey: true'}
+            }});
+            const up = new KeyboardEvent('keyup', {{
+                key: '.',
+                code: 'Period',
+                bubbles: true,
+                cancelable: true,
+                {'metaKey: true' if is_mac else 'ctrlKey: true'}
+            }});
+            w.dispatchEvent(down);
+            w.dispatchEvent(up);
+            return 'OK';
+        }})();
+    """
+    return str(cdp_eval_on(conn, js))
+
+
+def cursor_set_agent_mode(mode: str, mirrored=None) -> str:
+    """Switch Cursor composer agent mode (agent / plan / ask / debug) via DOM + keyboard fallback.
+
+    Cursor updates its UI often; this tries: open mode control → pick row → Ctrl/Cmd+. → pick row.
+    """
+    want = (mode or '').strip().lower()
+    if want not in CURSOR_AGENT_MODES:
+        return f'ERROR: unknown mode {mode!r} (use agent, plan, ask, debug)'
+
+    try:
+        if mirrored:
+            mm = _normalize_mirror_row(mirrored)
+            iid = mm[0]
+            if iid not in instance_registry:
+                return (
+                    'ERROR: Cursor workspace for this chat is not connected — '
+                    'open that project or restart the bridge'
+                )
+            cursor_switch_to_mirrored(mirrored)
+            conn = instance_registry[iid]['ws']
+        else:
+            conn = active_conn()
+        if not conn:
+            return 'ERROR: no Cursor CDP connection'
+
+        pick_js = _CURSOR_AGENT_MODE_PICK_JS.replace('__WANT__', json.dumps(want))
+        r0 = cdp_eval_on(conn, pick_js)
+        if r0 and str(r0).startswith('OK'):
+            return str(r0)
+
+        r1 = cdp_eval_on(conn, _CURSOR_AGENT_MODE_OPEN_JS)
+        if r1 and str(r1).startswith('OPENED'):
+            time.sleep(0.22)
+            r2 = cdp_eval_on(conn, pick_js)
+            if r2 and str(r2).startswith('OK'):
+                return str(r2)
+
+        fk = _cdp_focus_aislash_editor(conn)
+        if fk != 'OK':
+            return fk
+        time.sleep(0.06)
+        _cdp_agent_mode_keyboard_picker(conn)
+        time.sleep(0.28)
+        r3 = cdp_eval_on(conn, pick_js)
+        if r3 and str(r3).startswith('OK'):
+            return str(r3)
+
+        return (
+            f'ERROR: could not switch to {want!r} — open the mode menu in Cursor manually once; '
+            'if the UI changed, file an issue with your Cursor version'
+        )
+    except Exception as e:
+        err = f'ERROR: {type(e).__name__}: {e}'
+        print(f'[sender] cursor_set_agent_mode: {err}')
+        return err
+
+
 def cursor_get_active_conv():
     """Get the name of the active conversation tab."""
     return (
@@ -3333,7 +3544,10 @@ def sender_thread():
                     ]
                     if conv_name:
                         lines.append(f'💬 {conv_name}')
-                    lines.append('\n/newchat /chats /pause /play /screenshot /unpair')
+                    lines.append(
+                        '\n/newchat /chats /mode /pause /play /screenshot /unpair\n'
+                        'Modes: /mode agent | plan | ask | debug (or /agent /plan /ask /debug)'
+                    )
                     tg_send(cid, '\n'.join(lines), message_thread_id=thr)
                     continue
 
@@ -3399,7 +3613,46 @@ def sender_thread():
                     print(f'[sender] New chat: {result}')
                     continue
 
-                if text in ('/chats', '/agents', '/agent'):
+                _mode_mc = _mirror_for_inbound(route)
+                if text.startswith('/mode') or text.rstrip() in (
+                    '/agent',
+                    '/plan',
+                    '/ask',
+                    '/debug',
+                ):
+                    if text.startswith('/mode'):
+                        parts = text.split(None, 1)
+                        if len(parts) < 2:
+                            tg_send(
+                                cid,
+                                'Usage: /mode agent | plan | ask | debug\n'
+                                'Shorthand: /agent  /plan  /ask  /debug',
+                                message_thread_id=thr,
+                            )
+                            continue
+                        sub = parts[1].strip().lower().split()[0]
+                    else:
+                        sub = text.strip().lstrip('/').lower()
+                    if sub not in CURSOR_AGENT_MODES:
+                        tg_send(
+                            cid,
+                            f'Unknown mode {sub!r}. Use: agent, plan, ask, debug',
+                            message_thread_id=thr,
+                        )
+                        continue
+                    print(f'[sender] Set agent mode → {sub}')
+                    mres = cursor_set_agent_mode(sub, mirrored=_mode_mc)
+                    if mres.startswith('OK'):
+                        tg_send(
+                            cid,
+                            f'Cursor mode → {sub.capitalize()}',
+                            message_thread_id=thr,
+                        )
+                    else:
+                        tg_send(cid, mres, message_thread_id=thr)
+                    continue
+
+                if text in ('/chats', '/agents'):
                     # Single Telegram message — previously we sent one per workspace key (N workspaces => N pings).
                     keyboard_rows = []
                     inst_with = [
