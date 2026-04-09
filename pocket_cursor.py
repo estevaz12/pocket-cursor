@@ -118,6 +118,9 @@ chat_id_file = Path(__file__).parent / '.chat_id'
 active_chat_file = Path(__file__).parent / '.active_chat'
 routes_file = Path(__file__).parent / '.telegram_routes.json'
 
+# Set from getMe after Telegram API is reachable (used to normalize /cmd@BotName).
+TELEGRAM_BOT_USERNAME = ''
+
 # Shared state
 cdp_lock = threading.Lock()
 ws = None  # Active instance's WebSocket (all cdp_* functions use this)
@@ -613,6 +616,22 @@ def _tg_maybe_unpin_outbound(cid: int | None, send_result: dict[str, Any] | None
         )
     except OSError:
         pass
+
+
+def _telegram_command_normalize(message_text: str, bot_username: str) -> str:
+    """Strip @BotName from the leading /command token (groups / command menu)."""
+    if not message_text or not message_text.startswith('/'):
+        return message_text
+    u = (bot_username or '').strip().lstrip('@')
+    if not u:
+        return message_text.strip()
+    parts = message_text.strip().split(None, 1)
+    token = parts[0]
+    suffix = '@' + u
+    if token.lower().endswith(suffix.lower()):
+        token = token[: -len(suffix)]
+        return (token + (' ' + parts[1] if len(parts) > 1 else '')).strip()
+    return message_text.strip()
 
 
 def tg_typing(cid, message_thread_id=None):
@@ -2324,6 +2343,48 @@ _CURSOR_AGENT_MODE_PICK_JS = r"""
     const valid = { agent: 1, plan: 1, ask: 1, debug: 1 };
     if (!valid[want]) return 'ERROR:bad_mode';
 
+    function isVisible(el) {
+        if (!el) return false;
+        if (el.offsetParent) return true;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    }
+
+    function firePick(row) {
+        const clickable = row.querySelector('.monaco-icon-label') || row;
+        clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        row.click();
+        return 'OK:pick';
+    }
+
+    // Cursor 2025+: unified dropdown uses composer-mode-* ids; Ask row id ends with -chat.
+    const idSuffix = want === 'ask' ? '-chat' : ('-' + want);
+    for (const el of document.querySelectorAll('[id^="composer-mode-"]')) {
+        if (!isVisible(el)) continue;
+        const id = el.getAttribute('id') || '';
+        if (!id.endsWith(idSuffix)) continue;
+        const row = el.closest('.composer-unified-context-menu-item') || el;
+        if (!isVisible(row)) continue;
+        return firePick(row);
+    }
+
+    // Same menu: match highlighted label (UI shows "Ask" for ask mode).
+    function labelMatches(lab) {
+        const t = norm(lab);
+        if (t === want) return true;
+        if (want === 'ask' && (t === 'ask' || t === 'chat')) return true;
+        return false;
+    }
+    for (const row of document.querySelectorAll(
+        '.mentions-menu .composer-unified-context-menu-item, .typeahead-popover .composer-unified-context-menu-item'
+    )) {
+        if (!isVisible(row)) continue;
+        const hl = row.querySelector('.monaco-highlighted-label');
+        const lab = (hl && hl.textContent) || row.textContent || '';
+        if (!labelMatches(lab)) continue;
+        return firePick(row);
+    }
+
     function matches(rowText) {
         const t = norm(rowText);
         if (t === want) return true;
@@ -2344,10 +2405,7 @@ _CURSOR_AGENT_MODE_PICK_JS = r"""
             if (!row.offsetParent) continue;
             const t = row.textContent || '';
             if (!matches(t)) continue;
-            const clickable = row.querySelector('.monaco-icon-label') || row;
-            clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-            row.click();
-            return 'OK:pick';
+            return firePick(row);
         }
     }
     return 'NO_MATCH';
@@ -3533,8 +3591,13 @@ def sender_thread():
 
                 print(f'[sender] {user}: {text}')
 
-                # Handle commands
-                if text == '/start':
+                # Handle commands (normalize /cmd@BotUsername for routing only)
+                cmd = (
+                    _telegram_command_normalize(text, TELEGRAM_BOT_USERNAME)
+                    if text.startswith('/')
+                    else text
+                )
+                if cmd == '/start':
                     conv_name = cursor_get_active_conv()
                     status_line = '⏸ Paused' if muted else '▶ Active'
                     instances = len(instance_registry)
@@ -3551,7 +3614,7 @@ def sender_thread():
                     tg_send(cid, '\n'.join(lines), message_thread_id=thr)
                     continue
 
-                if text == '/unpair':
+                if cmd == '/unpair':
                     OWNER_ID = None
                     if owner_file.exists():
                         owner_file.unlink()
@@ -3563,7 +3626,7 @@ def sender_thread():
                     print('[owner] Unpaired')
                     continue
 
-                if text == '/pause':
+                if cmd == '/pause':
                     muted = True
                     muted_file.touch()
                     tg_send(
@@ -3574,7 +3637,7 @@ def sender_thread():
                     print('[sender] Paused')
                     continue
 
-                if text == '/play':
+                if cmd == '/play':
                     muted = False
                     muted_file.unlink(missing_ok=True)
                     # Include active conversation name in resume message
@@ -3586,7 +3649,7 @@ def sender_thread():
                     print('[sender] Resumed')
                     continue
 
-                if text == '/screenshot':
+                if cmd == '/screenshot':
                     print(
                         f'[sender] Taking screenshot of {active_instance_id and active_instance_id[:8]}...'
                     )
@@ -3605,7 +3668,7 @@ def sender_thread():
                         tg_send(cid, 'Failed to capture screenshot.', message_thread_id=thr)
                     continue
 
-                if text == '/newchat':
+                if cmd == '/newchat':
                     print('[sender] Creating new chat...')
                     result = cursor_new_chat()
                     if not result or not result.startswith('OK'):
@@ -3614,14 +3677,14 @@ def sender_thread():
                     continue
 
                 _mode_mc = _mirror_for_inbound(route)
-                if text.startswith('/mode') or text.rstrip() in (
+                if cmd.startswith('/mode') or cmd.rstrip() in (
                     '/agent',
                     '/plan',
                     '/ask',
                     '/debug',
                 ):
-                    if text.startswith('/mode'):
-                        parts = text.split(None, 1)
+                    if cmd.startswith('/mode'):
+                        parts = cmd.split(None, 1)
                         if len(parts) < 2:
                             tg_send(
                                 cid,
@@ -3632,7 +3695,7 @@ def sender_thread():
                             continue
                         sub = parts[1].strip().lower().split()[0]
                     else:
-                        sub = text.strip().lstrip('/').lower()
+                        sub = cmd.strip().lstrip('/').lower()
                     if sub not in CURSOR_AGENT_MODES:
                         tg_send(
                             cid,
@@ -3652,7 +3715,7 @@ def sender_thread():
                         tg_send(cid, mres, message_thread_id=thr)
                     continue
 
-                if text in ('/chats', '/agents'):
+                if cmd in ('/chats', '/agents'):
                     # Single Telegram message — previously we sent one per workspace key (N workspaces => N pings).
                     keyboard_rows = []
                     inst_with = [
@@ -4946,6 +5009,7 @@ if not me.get('ok'):
     print('ERROR: Cannot reach Telegram API')
     sys.exit(1)
 bot = me['result']
+TELEGRAM_BOT_USERNAME = str(bot.get('username') or '')
 print(f'Bot: @{bot["username"]} ({bot["first_name"]})')
 
 # Set bot description if not already configured (shown to new users above the START button)
