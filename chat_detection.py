@@ -6,7 +6,8 @@ and chat enumeration. All DOM knowledge about Cursor's chat UI lives here.
 Exports:
     install_chat_listener(ws_conn) -- inject JS listener + __pc_report binding
     start_chat_listener(ws_conn, label, on_switch, on_rename) -- daemon thread
-    list_chats(ws_conn) -- enumerate all open chats [{pc_id, name, active}]
+    list_chats(ws_conn) -- enumerate all open chats [{pc_id, name, active, agents_group?}]
+        Glass Agents window rows may include agents_group (sidebar section label).
 
 See _active_chat_detection_plan.md for design rationale and DOM analysis.
 """
@@ -71,7 +72,17 @@ _LISTENER_JS = r"""
     document.querySelectorAll('[data-pc-id]').forEach(el => el.removeAttribute('data-pc-id'));
     let lastPcId = null;
 
+    function isGlassAgentsUi() {
+        if (document.body && document.body.getAttribute('data-cursor-glass-mode') === 'true') return true;
+        return !!document.querySelector('nav[data-component="workspace-sidebar"] .glass-sidebar-agent-menu-btn');
+    }
+
     function getComposerId() {
+        if (isGlassAgentsUi()) {
+            const bar = document.querySelector('[data-component="agent-panel"] .composer-bar[data-composer-id]');
+            const cid = bar && bar.getAttribute('data-composer-id');
+            return (cid && /^[0-9a-f]{8}-/.test(cid)) ? cid : '';
+        }
         const el = document.querySelector('.composite.auxiliarybar[data-composer-id]')
                 || document.querySelector('.composer-bar[data-composer-id]');
         const cid = el && el.getAttribute('data-composer-id');
@@ -100,6 +111,13 @@ _LISTENER_JS = r"""
     }
 
     function findNearestChat(el) {
+        if (isGlassAgentsUi()) {
+            const tiptap = el.closest('.ui-prompt-input-editor__input');
+            if (tiptap && tiptap.getAttribute('contenteditable') === 'true') {
+                const ap = document.querySelector('[data-component="agent-panel"]');
+                if (ap && ap.contains(tiptap)) return tiptap;
+            }
+        }
         const inputs = [...document.querySelectorAll('[data-lexical-editor="true"][contenteditable="true"]')];
         if (!inputs.length) return null;
         const container = el.closest('.editor-group-container') || el.closest('[class*="auxiliarybar"]');
@@ -110,6 +128,22 @@ _LISTENER_JS = r"""
     }
 
     function extractChatInfo(input) {
+        if (isGlassAgentsUi()) {
+            const ap = document.querySelector('[data-component="agent-panel"]');
+            if (ap && ap.contains(input) && input.classList && input.classList.contains('ProseMirror')) {
+                const activeBtn = document.querySelector(
+                    'nav[data-component="workspace-sidebar"] .glass-sidebar-agent-menu-btn[data-active="true"]');
+                if (activeBtn) {
+                    const nameEl = activeBtn.querySelector('.glass-sidebar-agent-menu-label__name');
+                    const name = nameEl ? nameEl.textContent.trim() : '';
+                    if (name) {
+                        const cid = getComposerId();
+                        const pcId = cid ? tagWithCid(activeBtn, cid) : ensurePcId(activeBtn);
+                        return { name: name, pc_id: pcId };
+                    }
+                }
+            }
+        }
         const composerEl = input.closest('[data-composer-id]');
         const cid = composerEl ? composerEl.getAttribute('data-composer-id') : '';
         const hasCid = cid && /^[0-9a-f]{8}-/.test(cid);
@@ -168,6 +202,14 @@ _LISTENER_JS = r"""
                 return tabEl ? ensurePcId(tabEl) : '';
             }
         }
+        if (isGlassAgentsUi()) {
+            for (const btn of document.querySelectorAll(
+                'nav[data-component="workspace-sidebar"] .glass-sidebar-agent-menu-btn')) {
+                const nameEl = btn.querySelector('.glass-sidebar-agent-menu-label__name');
+                const tabName = nameEl ? nameEl.textContent.trim() : '';
+                if (tabName === name) return ensurePcId(btn);
+            }
+        }
         return '';
     }
 
@@ -176,8 +218,33 @@ _LISTENER_JS = r"""
         if (pcEl) {
             const label = pcEl.querySelector('.composer-tab-label')
                        || pcEl.querySelector('a[aria-id="chat-horizontal-tab"]')
-                       || pcEl.querySelector('.agent-sidebar-cell-text');
+                       || pcEl.querySelector('.agent-sidebar-cell-text')
+                       || pcEl.querySelector('.glass-sidebar-agent-menu-label__name');
             if (label) return { name: label.getAttribute('aria-label') || label.textContent.trim(), pc_id: pcEl.getAttribute('data-pc-id') };
+        }
+        const glassBtn = el.closest('.glass-sidebar-agent-menu-btn');
+        if (glassBtn && isGlassAgentsUi()) {
+            const nameEl = glassBtn.querySelector('.glass-sidebar-agent-menu-label__name');
+            const name = nameEl ? nameEl.textContent.trim() : '';
+            if (name) {
+                let pcId = glassBtn.getAttribute('data-pc-id');
+                if (!pcId) {
+                    const cid = getComposerId();
+                    pcId = (glassBtn.getAttribute('data-active') === 'true' && cid)
+                        ? tagWithCid(glassBtn, cid) : ensurePcId(glassBtn);
+                }
+                return { name: name, pc_id: pcId };
+            }
+        }
+        if (isGlassAgentsUi()) {
+            const tiptap = el.closest('.ui-prompt-input-editor__input');
+            if (tiptap && tiptap.getAttribute('contenteditable') === 'true') {
+                const ap = document.querySelector('[data-component="agent-panel"]');
+                if (ap && ap.contains(tiptap)) {
+                    const chat = extractChatInfo(tiptap);
+                    if (chat) return chat;
+                }
+            }
         }
         const chatIcon = el.closest('.codicon-chat');
         if (chatIcon) {
@@ -196,8 +263,14 @@ _LISTENER_JS = r"""
     }
 
     function conversationFingerprintFromComposer() {
-        const composerPanel = document.querySelector('.composite.auxiliarybar .composer-messages-container')
-            || document.querySelector('.auxiliarybar .composer-messages-container');
+        let composerPanel = null;
+        if (isGlassAgentsUi()) {
+            composerPanel = document.querySelector('[data-component="agent-panel"] .composer-messages-container');
+        }
+        if (!composerPanel) {
+            composerPanel = document.querySelector('.composite.auxiliarybar .composer-messages-container')
+                || document.querySelector('.auxiliarybar .composer-messages-container');
+        }
         if (composerPanel) {
             const humans = composerPanel.querySelectorAll('[data-message-kind="human"][data-message-id]');
             if (humans.length) {
@@ -305,7 +378,17 @@ _LIST_CHATS_JS = r"""
         return pcId;
     }
 
+    function isGlassAgentsUi() {
+        if (document.body && document.body.getAttribute('data-cursor-glass-mode') === 'true') return true;
+        return !!document.querySelector('nav[data-component="workspace-sidebar"] .glass-sidebar-agent-menu-btn');
+    }
+
     function getComposerId() {
+        if (isGlassAgentsUi()) {
+            const bar = document.querySelector('[data-component="agent-panel"] .composer-bar[data-composer-id]');
+            const cid = bar && bar.getAttribute('data-composer-id');
+            return (cid && /^[0-9a-f]{8}-/.test(cid)) ? cid : '';
+        }
         const el = document.querySelector('.composite.auxiliarybar[data-composer-id]')
                 || document.querySelector('.composer-bar[data-composer-id]');
         const cid = el && el.getAttribute('data-composer-id');
@@ -374,8 +457,14 @@ _LIST_CHATS_JS = r"""
     });
 
     // 2. Agent-tabs: only retag if new cid won't collide with editor-group
-    const composerPanel = document.querySelector('.composite.auxiliarybar .composer-messages-container')
-                       || document.querySelector('.auxiliarybar .composer-messages-container');
+    function getActiveComposerMessagesPanel() {
+        if (isGlassAgentsUi()) {
+            return document.querySelector('[data-component="agent-panel"] .composer-messages-container');
+        }
+        return document.querySelector('.composite.auxiliarybar .composer-messages-container')
+            || document.querySelector('.auxiliarybar .composer-messages-container');
+    }
+    const composerPanel = getActiveComposerMessagesPanel();
     const activeFingerprint = composerPanel ? conversationFingerprintForPanel(composerPanel) : null;
 
     const agentTabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
@@ -452,6 +541,50 @@ _LIST_CHATS_JS = r"""
         if (isChecked && activeFingerprint) entry.msg_id = activeFingerprint;
         results.push(entry);
     });
+
+    // 4. Agents window (glass): workspace sidebar lists multiple folders / agents
+    if (isGlassAgentsUi()) {
+        let gidx = 0;
+        document.querySelectorAll('nav[data-component="workspace-sidebar"] .ui-sidebar-group').forEach(group => {
+            const labelEl = group.querySelector('.ui-sidebar-group-label-text');
+            const agentsGroup = labelEl ? labelEl.textContent.trim() : '';
+            const container = group.querySelector('.glass-sidebar-agent-list-container');
+            if (!container) return;
+            container.querySelectorAll('.glass-sidebar-agent-menu-btn').forEach(btn => {
+                const nameEl = btn.querySelector('.glass-sidebar-agent-menu-label__name');
+                const name = nameEl ? nameEl.textContent.trim() : '';
+                if (!name) return;
+                const isActive = btn.getAttribute('data-active') === 'true';
+                let pcId = btn.getAttribute('data-pc-id');
+                if (isActive && activeFingerprint) {
+                    const cid = getComposerId();
+                    if (cid) {
+                        const newPcId = cidFromUuid(cid);
+                        if (!usedPcIds.has(newPcId)) {
+                            pcId = tagWithCid(btn, cid);
+                        }
+                    }
+                }
+                const stableLabel = agentsGroup + '\\0' + name;
+                if (!pcId || !pcId.startsWith('cid-')) {
+                    if (!pcId) {
+                        pcId = stablePcId('g', gidx, stableLabel);
+                        btn.setAttribute('data-pc-id', pcId);
+                    }
+                }
+                usedPcIds.add(pcId);
+                const entry = {
+                    pc_id: pcId,
+                    name: name,
+                    active: isActive
+                };
+                if (agentsGroup) entry.agents_group = agentsGroup;
+                if (isActive && activeFingerprint) entry.msg_id = activeFingerprint;
+                results.push(entry);
+                gidx++;
+            });
+        });
+    }
 
     return JSON.stringify(results);
 })()

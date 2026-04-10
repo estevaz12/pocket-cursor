@@ -67,6 +67,126 @@ from start_cursor import discover_cdp_ports
 print = ts_print
 
 
+# ── Cursor composer / Agents (glass) TipTap prompt — shared CDP JS ───────────
+
+_PC_PROMPT_EDITOR_HELPERS_JS = """
+    function isGlassAgentsUi() {
+        if (document.body && document.body.getAttribute('data-cursor-glass-mode') === 'true') return true;
+        return !!document.querySelector('nav[data-component="workspace-sidebar"] .glass-sidebar-agent-menu-btn');
+    }
+    function findPromptEditor() {
+        if (isGlassAgentsUi()) {
+            const ap = document.querySelector('[data-component="agent-panel"]');
+            if (ap) {
+                const follow = ap.querySelector(
+                    '.agent-panel-followup-input .ui-prompt-input-editor__input[contenteditable="true"]');
+                if (follow) return follow;
+                const tt = ap.querySelector('.ui-prompt-input-editor__input[contenteditable="true"]');
+                if (tt) return tt;
+            }
+        }
+        let editor = document.querySelector('.aislash-editor-input');
+        if (!editor) {
+            const all = document.querySelectorAll('[data-lexical-editor="true"]');
+            for (const ed of all) {
+                if (ed.contentEditable === 'true') { editor = ed; break; }
+            }
+        }
+        return editor || null;
+    }
+"""
+
+PC_PROMPT_EDITOR_FOCUS_JS = (
+    '(function() {\n'
+    + _PC_PROMPT_EDITOR_HELPERS_JS
+    + """
+    const editor = findPromptEditor();
+    if (!editor) return 'ERROR: no input editor found';
+    editor.focus();
+    editor.click();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return 'OK';
+})();"""
+)
+
+PC_PROMPT_EDITOR_CLEAR_JS = (
+    '(function() {\n'
+    + _PC_PROMPT_EDITOR_HELPERS_JS
+    + """
+    const editor = findPromptEditor();
+    if (!editor) return 'NO_EDITOR';
+    if (!editor.textContent.trim()) return 'EMPTY';
+    editor.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('delete');
+    return 'CLEARED';
+})();"""
+)
+
+PC_SEND_VERIFY_AND_CLICK_JS = (
+    '(function() {\n'
+    + _PC_PROMPT_EDITOR_HELPERS_JS
+    + """
+    const editor = findPromptEditor();
+    if (!editor || !editor.textContent.trim()) return 'ERROR: text not inserted';
+    const ap = document.querySelector('[data-component="agent-panel"]');
+    const selectors = [
+        '.send-with-mode .anysphere-icon-button',
+        'button[aria-label="Send"]',
+        '.send-with-mode button',
+    ];
+    for (const sel of selectors) {
+        const root = ap || document;
+        const btn = root.querySelector(sel) || document.querySelector(sel);
+        if (btn) {
+            setTimeout(() => btn.click(), 0);
+            return 'OK: ' + sel;
+        }
+    }
+    if (isGlassAgentsUi() && editor.classList && editor.classList.contains('ProseMirror')) {
+        return 'OK:glass-enter';
+    }
+    return 'ERROR: no send button';
+})();"""
+)
+
+PC_CLICK_SEND_ONLY_JS = (
+    '(function() {\n'
+    + _PC_PROMPT_EDITOR_HELPERS_JS
+    + """
+    const editor = findPromptEditor();
+    if (editor) { editor.focus(); }
+    const ap = document.querySelector('[data-component="agent-panel"]');
+    const selectors = [
+        '.send-with-mode .anysphere-icon-button',
+        'button[aria-label="Send"]',
+        '.send-with-mode button',
+    ];
+    for (const sel of selectors) {
+        const root = ap || document;
+        const btn = root.querySelector(sel) || document.querySelector(sel);
+        if (btn) {
+            setTimeout(() => btn.click(), 0);
+            return 'OK: ' + sel;
+        }
+    }
+    if (isGlassAgentsUi() && editor && editor.classList && editor.classList.contains('ProseMirror')) {
+        return 'OK:glass-enter';
+    }
+    return 'ERROR: no send button';
+})();"""
+)
+
+
 # ── Config ───────────────────────────────────────────────────────────────────
 
 env_path = Path(__file__).parent / '.env'
@@ -1041,12 +1161,17 @@ def parse_instance_title(title):
         "file.py - WorkspaceName - Cursor"                    → "WorkspaceName"
         "file.md - Name (Workspace) - Cursor"                 → "Name (Workspace)"
         "Interactive - file.py - WorkspaceName - Cursor"      → "WorkspaceName"
+        "Agents - Cursor"                                     → "(Agents)" (multi-workspace window)
 
-    Workspace is always the second-to-last segment before "- Cursor".
+    Workspace is usually the second-to-last segment before "- Cursor".
     """
     parts = title.split(' - ')
     if len(parts) >= 3 and parts[-1].strip() == 'Cursor':
         return parts[-2]
+    if len(parts) == 2 and parts[-1].strip() == 'Cursor':
+        first = parts[0].strip()
+        if first.lower() == 'agents':
+            return '(Agents)'
     return None
 
 
@@ -1863,55 +1988,33 @@ def cursor_paste_image(image_bytes, mime='image/png', filename='image.png'):
     b64 = base64.b64encode(image_bytes).decode('ascii')
 
     # Focus editor first
-    focus_result = cdp_eval("""
-        (function() {
-            let editor = document.querySelector('.aislash-editor-input');
-            if (!editor) {
-                const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                for (const ed of all) {
-                    if (ed.contentEditable === 'true') { editor = ed; break; }
-                }
-            }
-            if (!editor) return 'ERROR: no editor';
-            editor.focus();
-            editor.click();
-            return 'OK';
-        })();
-    """)
+    focus_result = cdp_eval(PC_PROMPT_EDITOR_FOCUS_JS)
     if focus_result != 'OK':
         return focus_result
 
     time.sleep(0.3)
 
     # Inject image via paste event
-    result = cdp_eval(f"""
-        (function() {{
+    result = cdp_eval(
+        '(function() {\n'
+        + _PC_PROMPT_EDITOR_HELPERS_JS
+        + f"""
             const b64 = "{b64}";
             const mime = "{mime}";
             const filename = "{filename}";
 
-            // Decode base64 to binary
             const binary = atob(b64);
             const bytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
             const blob = new Blob([bytes], {{ type: mime }});
             const file = new File([blob], filename, {{ type: mime }});
 
-            // Build DataTransfer with the image file
             const dt = new DataTransfer();
             dt.items.add(file);
 
-            // Find the editor
-            let editor = document.querySelector('.aislash-editor-input');
-            if (!editor) {{
-                const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                for (const ed of all) {{
-                    if (ed.contentEditable === 'true') {{ editor = ed; break; }}
-                }}
-            }}
+            const editor = findPromptEditor();
             if (!editor) return 'ERROR: no editor for paste';
 
-            // Dispatch paste event
             const event = new ClipboardEvent('paste', {{
                 bubbles: true,
                 cancelable: true,
@@ -1919,8 +2022,8 @@ def cursor_paste_image(image_bytes, mime='image/png', filename='image.png'):
             }});
             editor.dispatchEvent(event);
             return 'OK: paste dispatched';
-        }})();
-    """)
+        }})();"""
+    )
     return result
 
 
@@ -1929,23 +2032,13 @@ def cursor_paste_image(image_bytes, mime='image/png', filename='image.png'):
 
 def cursor_click_send():
     """Click the send button in Cursor's editor. Used after image paste with no text."""
-    return cdp_eval("""
-        (function() {
-            const selectors = [
-                '.send-with-mode .anysphere-icon-button',
-                'button[aria-label="Send"]',
-                '.send-with-mode button',
-            ];
-            for (const sel of selectors) {
-                const btn = document.querySelector(sel);
-                if (btn) {
-                    setTimeout(() => btn.click(), 0);
-                    return 'OK: ' + sel;
-                }
-            }
-            return 'ERROR: no send button';
-        })();
-    """)
+    r = cdp_eval(PC_CLICK_SEND_ONLY_JS)
+    if r == 'OK:glass-enter':
+        c = active_conn()
+        if c:
+            with cdp_lock:
+                return _cdp_dispatch_enter(c)
+    return r
 
 
 _CONTEXT_PCTS_MAX = 200
@@ -2015,21 +2108,7 @@ def cursor_prefill_input(text, conn=None):
                     'id': mid,
                     'method': 'Runtime.evaluate',
                     'params': {
-                        'expression': """
-                (function() {
-                    let editor = document.querySelector('.aislash-editor-input');
-                    if (!editor) {
-                        const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                        for (const ed of all) {
-                            if (ed.contentEditable === 'true') { editor = ed; break; }
-                        }
-                    }
-                    if (!editor) return 'ERROR: no input editor found';
-                    editor.focus();
-                    editor.click();
-                    return 'OK';
-                })();
-            """,
+                        'expression': PC_PROMPT_EDITOR_FOCUS_JS,
                         'returnByValue': True,
                     },
                 }
@@ -2064,27 +2143,7 @@ def cursor_clear_input(conn=None):
                     'id': mid,
                     'method': 'Runtime.evaluate',
                     'params': {
-                        'expression': """
-                (function() {
-                    let editor = document.querySelector('.aislash-editor-input');
-                    if (!editor) {
-                        const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                        for (const ed of all) {
-                            if (ed.contentEditable === 'true') { editor = ed; break; }
-                        }
-                    }
-                    if (!editor) return 'NO_EDITOR';
-                    if (!editor.textContent.trim()) return 'EMPTY';
-                    editor.focus();
-                    const sel = window.getSelection();
-                    const range = document.createRange();
-                    range.selectNodeContents(editor);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    document.execCommand('delete');
-                    return 'CLEARED';
-                })();
-            """,
+                        'expression': PC_PROMPT_EDITOR_CLEAR_JS,
                         'returnByValue': True,
                     },
                 }
@@ -2120,6 +2179,7 @@ def cdp_activate_agent_tab(conn, resolved_pc_id: str, resolved_name: str) -> str
                 if (c.querySelector('a[aria-id="chat-horizontal-tab"]')) {{ el = c; break; }}
                 if (c.querySelector('.composer-tab-label')) {{ el = c; break; }}
                 if (c.classList && c.classList.contains('agent-sidebar-cell')) {{ el = c; break; }}
+                if (c.classList && c.classList.contains('glass-sidebar-agent-menu-btn')) {{ el = c; break; }}
             }}
             if (!el && nameHint) {{
                 const w = normChatTitle(nameHint);
@@ -2144,6 +2204,42 @@ def cdp_activate_agent_tab(conn, resolved_pc_id: str, resolved_name: str) -> str
                     if (g === w) {{ el = a.closest('li'); break; }}
                 }}
             }}
+            if (!el && nameHint) {{
+                function parseNameHint(hint) {{
+                    const raw = (hint || '').trim();
+                    const idx = raw.indexOf(' / ');
+                    if (idx >= 1) {{
+                        return {{ group: raw.slice(0, idx).trim(), title: raw.slice(idx + 3).trim() }};
+                    }}
+                    return {{ group: '', title: raw }};
+                }}
+                const parsedG = parseNameHint(nameHint);
+                const ng = normChatTitle(parsedG.group);
+                const nt = normChatTitle(parsedG.title);
+                const nh = normChatTitle(nameHint);
+                const nav = document.querySelector('nav[data-component="workspace-sidebar"]');
+                if (nav && nav.querySelector('.glass-sidebar-agent-menu-btn')) {{
+                    const groups = nav.querySelectorAll('.ui-sidebar-group');
+                    for (let gi = 0; gi < groups.length && !el; gi++) {{
+                        const group = groups[gi];
+                        const labelEl = group.querySelector('.ui-sidebar-group-label-text');
+                        const ag = normChatTitle(labelEl ? labelEl.textContent.trim() : '');
+                        if (parsedG.group && ag !== ng) continue;
+                        const btns = group.querySelectorAll('.glass-sidebar-agent-menu-btn');
+                        for (let bi = 0; bi < btns.length && !el; bi++) {{
+                            const btn = btns[bi];
+                            const nameEl = btn.querySelector('.glass-sidebar-agent-menu-label__name');
+                            const nm = normChatTitle(nameEl ? nameEl.textContent.trim() : '');
+                            if (!nm) continue;
+                            if (parsedG.group) {{
+                                if (nm === nt) el = btn;
+                            }} else if (nm === nh) {{
+                                el = btn;
+                            }}
+                        }}
+                    }}
+                }}
+            }}
             if (!el) return 'ERROR: tab not found (pc_id=' + targetPcId + ', name=' + (nameHint || '?') + ', checked ' + candidates.length + ' id candidates)';
             const a = el.querySelector('a[aria-id="chat-horizontal-tab"]');
             if (a) {{ a.click(); return a.getAttribute('aria-label') || 'OK'; }}
@@ -2151,6 +2247,11 @@ def cdp_activate_agent_tab(conn, resolved_pc_id: str, resolved_name: str) -> str
                 el.click();
                 const ut = unifiedCellTitle(el);
                 return ut || 'OK';
+            }}
+            if (el.classList && el.classList.contains('glass-sidebar-agent-menu-btn')) {{
+                el.click();
+                const ne = el.querySelector('.glass-sidebar-agent-menu-label__name');
+                return ne ? (ne.textContent.trim() || 'OK') : 'OK';
             }}
             el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, button: 0}}));
             const label = el.querySelector('.label-name');
@@ -2179,6 +2280,34 @@ def cursor_switch_to_mirrored(mc: MirrorRow | tuple[str, str, str] | None) -> No
         except Exception:
             pass
     cdp_activate_agent_tab(info['ws'], pc_id, name)
+
+
+def _cdp_dispatch_enter(conn) -> str:
+    """Send Enter via CDP (glass Agents TipTap often has no Send button)."""
+    global msg_id_counter
+    for typ in ('keyDown', 'keyUp'):
+        with msg_id_lock:
+            msg_id_counter += 1
+            mid = msg_id_counter
+        conn.send(
+            json.dumps(
+                {
+                    'id': mid,
+                    'method': 'Input.dispatchKeyEvent',
+                    'params': {
+                        'type': typ,
+                        'key': 'Enter',
+                        'code': 'Enter',
+                        'windowsVirtualKeyCode': 13,
+                        'nativeVirtualKeyCode': 13,
+                    },
+                }
+            )
+        )
+        r = json.loads(conn.recv())
+        if r.get('error'):
+            return f'ERROR:dispatch:{r.get("error")}'
+    return 'OK:glass-enter'
 
 
 def cursor_send_message(text, raw=False, mirrored=None):
@@ -2224,27 +2353,7 @@ def cursor_send_message(text, raw=False, mirrored=None):
                         'id': mid,
                         'method': 'Runtime.evaluate',
                         'params': {
-                            'expression': """
-                (function() {
-                    let editor = document.querySelector('.aislash-editor-input');
-                    if (!editor) {
-                        const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                        for (const ed of all) {
-                            if (ed.contentEditable === 'true') { editor = ed; break; }
-                        }
-                    }
-                    if (!editor) return 'ERROR: no input editor found';
-                    editor.focus();
-                    // Move cursor to end so new text appends after any prefilled annotation
-                    const sel = window.getSelection();
-                    const range = document.createRange();
-                    range.selectNodeContents(editor);
-                    range.collapse(false);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    return 'OK';
-                })();
-            """,
+                            'expression': PC_PROMPT_EDITOR_FOCUS_JS,
                             'returnByValue': True,
                         },
                     }
@@ -2276,32 +2385,7 @@ def cursor_send_message(text, raw=False, mirrored=None):
                         'id': mid,
                         'method': 'Runtime.evaluate',
                         'params': {
-                            'expression': """
-                (function() {
-                    let editor = document.querySelector('.aislash-editor-input');
-                    if (!editor) {
-                        const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                        for (const ed of all) {
-                            if (ed.contentEditable === 'true') { editor = ed; break; }
-                        }
-                    }
-                    if (!editor || !editor.textContent.trim()) return 'ERROR: text not inserted';
-                    const selectors = [
-                        '.send-with-mode .anysphere-icon-button',
-                        'button[aria-label="Send"]',
-                        '.send-with-mode button',
-                    ];
-                    for (const sel of selectors) {
-                        const btn = document.querySelector(sel);
-                        if (btn) {
-                            // Async click — returns immediately, click fires on next microtask
-                            setTimeout(() => btn.click(), 0);
-                            return 'OK: ' + sel;
-                        }
-                    }
-                    return 'ERROR: no send button';
-                })();
-            """,
+                            'expression': PC_SEND_VERIFY_AND_CLICK_JS,
                             'returnByValue': True,
                         },
                     }
@@ -2309,6 +2393,8 @@ def cursor_send_message(text, raw=False, mirrored=None):
             )
             send_result = json.loads(conn.recv())
             result = send_result.get('result', {}).get('result', {}).get('value')
+            if result == 'OK:glass-enter':
+                result = _cdp_dispatch_enter(conn)
 
         t3 = time.time()
         print(
@@ -2325,6 +2411,12 @@ def cursor_new_chat():
     """Click the '+' button to create a new chat tab. Returns 'OK' or error."""
     return cdp_eval("""
         (function() {
+            const glass = document.querySelector('[data-action-id="new-agent"]')
+                || document.querySelector('.glass-sidebar-section-label-new-agent-button');
+            if (glass && glass.offsetParent) {
+                glass.click();
+                return 'OK';
+            }
             // Primary: the "New Chat" button in the auxiliary bar title
             const btn = document.querySelector('[data-command-id="auxiliaryBar.newAgentMenu"] a.codicon-add-two')
                      || document.querySelector('[data-command-id="composer.createNewComposerTab"] a.codicon-add-two')
@@ -2357,6 +2449,21 @@ _CURSOR_AGENT_MODE_PICK_JS = r"""
         return 'OK:pick';
     }
 
+    function labelMatches(lab) {
+        const t = norm(lab);
+        if (t === want) return true;
+        if (want === 'ask' && (t === 'ask' || t === 'chat')) return true;
+        return false;
+    }
+
+    // Agents (glass): Plan / Debug / Ask from plus-button menu
+    for (const row of document.querySelectorAll('div.ui-menu[role="menu"] .ui-menu__row[role="menuitem"], div.ui-menu[role="menu"] [role="menuitem"]')) {
+        if (!isVisible(row)) continue;
+        const lab = row.textContent || '';
+        if (!labelMatches(lab)) continue;
+        return firePick(row);
+    }
+
     // Cursor 2025+: unified dropdown uses composer-mode-* ids; Ask row id ends with -chat.
     const idSuffix = want === 'ask' ? '-chat' : ('-' + want);
     for (const el of document.querySelectorAll('[id^="composer-mode-"]')) {
@@ -2369,12 +2476,6 @@ _CURSOR_AGENT_MODE_PICK_JS = r"""
     }
 
     // Same menu: match highlighted label (UI shows "Ask" for ask mode).
-    function labelMatches(lab) {
-        const t = norm(lab);
-        if (t === want) return true;
-        if (want === 'ask' && (t === 'ask' || t === 'chat')) return true;
-        return false;
-    }
     for (const row of document.querySelectorAll(
         '.mentions-menu .composer-unified-context-menu-item, .typeahead-popover .composer-unified-context-menu-item'
     )) {
@@ -2422,6 +2523,12 @@ _CURSOR_AGENT_MODE_OPEN_JS = r"""
         el.click();
         return true;
     };
+
+    const ap = document.querySelector('[data-component="agent-panel"]');
+    if (ap) {
+        const plus = ap.querySelector('button.ui-prompt-input-plus-button');
+        if (plus && tryClick(plus)) return 'OPENED:glass-prompt-plus';
+    }
 
     // Cursor 2025+: Agent/Plan/Ask/Debug lives in .composer-unified-dropdown (div, not aria-haspopup button).
     let unified = null;
@@ -2475,21 +2582,15 @@ def _cdp_focus_aislash_editor(conn) -> str:
     return str(
         cdp_eval_on(
             conn,
-            """
-        (function() {
-            let editor = document.querySelector('.aislash-editor-input');
-            if (!editor) {
-                const all = document.querySelectorAll('[data-lexical-editor="true"]');
-                for (const ed of all) {
-                    if (ed.contentEditable === 'true') { editor = ed; break; }
-                }
-            }
+            '(function() {\n'
+            + _PC_PROMPT_EDITOR_HELPERS_JS
+            + """
+            const editor = findPromptEditor();
             if (!editor) return 'ERROR: no composer input';
             editor.focus();
             editor.click();
             return 'OK';
-        })();
-    """,
+            })();""",
         )
     )
 
@@ -2497,10 +2598,12 @@ def _cdp_focus_aislash_editor(conn) -> str:
 def _cdp_agent_mode_keyboard_picker(conn) -> str:
     """Dispatch Ctrl+. (Windows/Linux) or Cmd+. (macOS) on the window — Cursor's mode shortcut."""
     is_mac = sys.platform == 'darwin'
-    js = f"""
-        (function() {{
-            const ed = document.querySelector('.aislash-editor-input')
-                || document.querySelector('[data-lexical-editor="true"]');
+    km = 'metaKey: true' if is_mac else 'ctrlKey: true'
+    js = (
+        '(function() {\n'
+        + _PC_PROMPT_EDITOR_HELPERS_JS
+        + f"""
+            const ed = findPromptEditor();
             if (ed) {{ ed.focus(); }}
             const w = window;
             const down = new KeyboardEvent('keydown', {{
@@ -2508,20 +2611,20 @@ def _cdp_agent_mode_keyboard_picker(conn) -> str:
                 code: 'Period',
                 bubbles: true,
                 cancelable: true,
-                {'metaKey: true' if is_mac else 'ctrlKey: true'}
+                {km}
             }});
             const up = new KeyboardEvent('keyup', {{
                 key: '.',
                 code: 'Period',
                 bubbles: true,
                 cancelable: true,
-                {'metaKey: true' if is_mac else 'ctrlKey: true'}
+                {km}
             }});
             w.dispatchEvent(down);
             w.dispatchEvent(up);
             return 'OK';
-        }})();
-    """
+            }})();"""
+    )
     return str(cdp_eval_on(conn, js))
 
 
@@ -2587,6 +2690,13 @@ def cursor_get_active_conv():
     return (
         cdp_eval("""
         (function() {
+            const glassBtn = document.querySelector('.glass-sidebar-agent-menu-btn[data-active="true"]');
+            if (glassBtn) {
+                const ne = glassBtn.querySelector('.glass-sidebar-agent-menu-label__name');
+                if (ne) return ne.textContent.trim();
+            }
+            const titleTab = document.querySelector('.chat-title-tab-title');
+            if (titleTab && titleTab.textContent.trim()) return titleTab.textContent.trim();
             const tab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
             if (tab) return tab.getAttribute('aria-label') || '';
             const unified = document.querySelector('.unified-agents-sidebar .agent-sidebar-cell[data-selected="true"] .agent-sidebar-cell-text');
@@ -2601,6 +2711,26 @@ def cursor_list_convs():
     """List all conversation tabs. Returns [{name, active}]."""
     result = cdp_eval("""
         (function() {
+            const glassNav = document.querySelector('nav[data-component="workspace-sidebar"]');
+            if (glassNav && glassNav.querySelector('.glass-sidebar-agent-menu-btn')) {
+                const rows = [];
+                glassNav.querySelectorAll('.ui-sidebar-group').forEach(group => {
+                    const labelEl = group.querySelector('.ui-sidebar-group-label-text');
+                    const groupTitle = labelEl ? labelEl.textContent.trim() : '';
+                    group.querySelectorAll('.glass-sidebar-agent-menu-btn').forEach(btn => {
+                        if (btn.classList.contains('ui-sidebar-paginated-menu-toggle')) return;
+                        const nameEl = btn.querySelector('.glass-sidebar-agent-menu-label__name');
+                        const name = nameEl ? nameEl.textContent.trim() : '';
+                        if (!name) return;
+                        const display = groupTitle ? (groupTitle + ' / ' + name) : name;
+                        rows.push({
+                            name: display,
+                            active: btn.getAttribute('data-active') === 'true'
+                        });
+                    });
+                });
+                return JSON.stringify(rows);
+            }
             const agentAnchors = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
             const rows = [];
             if (agentAnchors.length > 0) {
@@ -2634,6 +2764,26 @@ def cursor_switch_conv(index):
     """Switch to conversation tab by 0-based index. Returns the tab name or error."""
     return cdp_eval(f"""
         (function() {{
+            const glassNav = document.querySelector('nav[data-component="workspace-sidebar"]');
+            if (glassNav && glassNav.querySelector('.glass-sidebar-agent-menu-btn')) {{
+                const cells = [];
+                glassNav.querySelectorAll('.ui-sidebar-group').forEach(group => {{
+                    const labelEl = group.querySelector('.ui-sidebar-group-label-text');
+                    const groupTitle = labelEl ? labelEl.textContent.trim() : '';
+                    group.querySelectorAll('.glass-sidebar-agent-menu-btn').forEach(btn => {{
+                        if (btn.classList.contains('ui-sidebar-paginated-menu-toggle')) return;
+                        const nameEl = btn.querySelector('.glass-sidebar-agent-menu-label__name');
+                        const name = nameEl ? nameEl.textContent.trim() : '';
+                        if (!name) return;
+                        const display = groupTitle ? (groupTitle + ' / ' + name) : name;
+                        cells.push({{ btn, display }});
+                    }});
+                }});
+                if ({index} >= cells.length) return 'ERROR: only ' + cells.length + ' chats open';
+                const picked = cells[{index}];
+                picked.btn.click();
+                return picked.display || 'OK';
+            }}
             const tabs = document.querySelectorAll('[class*="agent-tabs"] li[class*="action-item"] a[aria-id="chat-horizontal-tab"]');
             if (tabs.length > 0) {{
                 if ({index} >= tabs.length) return 'ERROR: only ' + tabs.length + ' tabs open';
@@ -2694,14 +2844,26 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
             }
 
             const composerPrefix = '__COMPOSER_PREFIX__';
+            function isGlassAgentsUi() {
+                if (document.body && document.body.getAttribute('data-cursor-glass-mode') === 'true') return true;
+                return !!document.querySelector('nav[data-component="workspace-sidebar"] .glass-sidebar-agent-menu-btn');
+            }
             let scope = document;
             if (composerPrefix) {
-                const scoped = document.querySelector('[data-composer-id^="' + composerPrefix + '"]');
+                const ap = document.querySelector('[data-component="agent-panel"]');
+                const inPanel = ap ? ap.querySelector('[data-composer-id^="' + composerPrefix + '"]') : null;
+                const scoped = inPanel || document.querySelector('[data-composer-id^="' + composerPrefix + '"]');
                 if (!scoped) return JSON.stringify({ turn_id: '', user_full: '', sections: [], images: [], conv: '' });
                 scope = scoped;
+            } else if (isGlassAgentsUi()) {
+                const ap = document.querySelector('[data-component="agent-panel"]');
+                if (ap) {
+                    const bar = ap.querySelector('.composer-bar[data-composer-id]');
+                    scope = bar || ap;
+                }
             }
             const containers = scope.querySelectorAll('.composer-human-ai-pair-container');
-            if (containers.length === 0) return JSON.stringify({ turn_id: '', user_full: '', sections: [], images: [] });
+            if (containers.length === 0) return JSON.stringify({ turn_id: '', user_full: '', sections: [], images: [], conv: '' });
 
             const last = containers[containers.length - 1];
 
@@ -3049,9 +3211,18 @@ def cursor_get_turn_info(composer_prefix='', conn=None):
                 }
             });
 
-            // Active conversation name: checked agent tab or unified sidebar
-            const convTab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
-            let convName = convTab ? convTab.getAttribute('aria-label') : '';
+            // Active conversation name: glass sidebar, title bar, agent tabs, unified sidebar
+            let convName = '';
+            const glassName = document.querySelector('.glass-sidebar-agent-menu-btn[data-active="true"] .glass-sidebar-agent-menu-label__name');
+            if (glassName) convName = glassName.textContent.trim();
+            if (!convName) {
+                const chatTitle = document.querySelector('.chat-title-tab-title');
+                if (chatTitle) convName = chatTitle.textContent.trim();
+            }
+            if (!convName) {
+                const convTab = document.querySelector('[class*="agent-tabs"] li[class*="checked"] a[aria-id="chat-horizontal-tab"]');
+                convName = convTab ? convTab.getAttribute('aria-label') : '';
+            }
             if (!convName) {
                 const unified = document.querySelector('.unified-agents-sidebar .agent-sidebar-cell[data-selected="true"] .agent-sidebar-cell-text');
                 if (unified) convName = unified.textContent.trim();
